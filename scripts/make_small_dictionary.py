@@ -628,6 +628,64 @@ def score_definition(definition: str, pos: Optional[str], original_gloss: str) -
     return score
 
 
+def detect_hierarchical_relationship(base_def: str, extended_def: str) -> bool:
+    """Detect if extended_def is a hierarchical extension of base_def."""
+    # Clean definitions for comparison
+    base_clean = base_def.strip().rstrip('.')
+    extended_clean = extended_def.strip()
+
+    # Check if extended starts with base (allowing for minor variations)
+    if extended_clean.startswith(base_clean):
+        # Must be significantly longer to be considered an extension
+        return len(extended_clean) > len(base_clean) * 1.1
+
+    # Check for semicolon pattern: "base; extension"
+    if ';' in extended_clean:
+        parts = extended_clean.split(';', 1)
+        first_part = parts[0].strip().rstrip('.')
+        return first_part == base_clean
+
+    # Check for "base. extension" pattern
+    sentences = _split_sentences(extended_clean)
+    if len(sentences) >= 2:
+        first_sentence = sentences[0].strip().rstrip('.')
+        return first_sentence == base_clean
+
+    return False
+
+
+def merge_hierarchical_definitions(base_def: str, extended_def: str) -> str:
+    """Merge two hierarchical definitions into one comprehensive definition."""
+    # If extended starts with base, use the extended version
+    if extended_def.startswith(base_def.strip().rstrip('.')):
+        return extended_def
+
+    # If semicolon pattern, already well-formatted
+    if ';' in extended_def:
+        return extended_def
+
+    # If multiple sentences, already well-formatted
+    sentences = _split_sentences(extended_def)
+    if len(sentences) >= 2:
+        return extended_def
+
+    # Fallback: combine with semicolon
+    base_clean = base_def.strip().rstrip('.')
+    extended_clean = extended_def.strip()
+    return f"{base_clean}; {extended_clean}"
+
+
+def find_hierarchical_merge(definition: str, word_definitions: List[Tuple[int, str]]) -> Optional[str]:
+    """Find if this definition can be merged with an existing one."""
+    for idx, existing_def in word_definitions:
+        if detect_hierarchical_relationship(existing_def, definition):
+            return merge_hierarchical_definitions(existing_def, definition)
+        elif detect_hierarchical_relationship(definition, existing_def):
+            return merge_hierarchical_definitions(definition, existing_def)
+
+    return None
+
+
 def extract_definitions(obj: Dict[str, Any]) -> List[Tuple[Optional[str], str]]:
     """Return list of (pos, gloss) pairs from a heterogenous entry object."""
     out: List[Tuple[Optional[str], str]] = []
@@ -1162,6 +1220,9 @@ def process_baseline_mode(
     # Quality scoring for smart deduplication
     definition_scores = {}  # definition -> (word, score) - track best version
 
+    # Hierarchical merging tracking
+    word_definitions = {}  # word -> [(idx, definition)] - track definitions per word for merging
+
     while True:
         line = in_f.readline()
         if not line:
@@ -1232,6 +1293,31 @@ def process_baseline_mode(
             else:
                 # First time seeing this definition
                 definition_scores[base_line] = (word, current_score)
+
+            # Hierarchical merging: check if this definition can be merged with existing ones for this word
+            if word in word_definitions:
+                merged_definition = find_hierarchical_merge(base_line, word_definitions[word])
+                if merged_definition:
+                    # Replace the existing definition with the merged version
+                    # Find which definition to replace (the base one)
+                    for i, (existing_idx, existing_def) in enumerate(word_definitions[word]):
+                        if (detect_hierarchical_relationship(existing_def, base_line) or
+                            detect_hierarchical_relationship(base_line, existing_def)):
+                            # Replace this definition with the merged version
+                            word_definitions[word][i] = (existing_idx, merged_definition)
+                            # Update the formatted list to use the merged definition
+                            for j, (fmt_idx, fmt_pos, fmt_src, fmt_line, fmt_gloss) in enumerate(formatted):
+                                if fmt_idx == existing_idx:
+                                    formatted[j] = (fmt_idx, fmt_pos, fmt_src, merged_definition, fmt_gloss)
+                                    break
+                            duplicates_skipped += 1
+                            base_line = merged_definition  # Use merged version
+                            break
+
+            # Add to word definitions tracking for future merging
+            if word not in word_definitions:
+                word_definitions[word] = []
+            word_definitions[word].append((def_index, base_line))
             seen_lines.add(base_line)
             source_sentence = _split_sentences(clean_gloss(gloss))
             source_sentence = source_sentence[0] if source_sentence else clean_gloss(gloss)
