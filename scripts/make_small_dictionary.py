@@ -590,6 +590,44 @@ def first_sentence_word_count(gloss: str) -> int:
     return _word_count(s)
 
 
+def score_definition(definition: str, pos: Optional[str], original_gloss: str) -> int:
+    """Score a definition for quality - higher scores are better."""
+    score = 0
+
+    # Length bonus (prefer more detailed definitions)
+    word_count = _word_count(definition)
+    if word_count >= 15:
+        score += 20  # Very detailed
+    elif word_count >= 10:
+        score += 15  # Detailed
+    elif word_count >= 5:
+        score += 10  # Moderate detail
+    elif word_count >= 3:
+        score += 5   # Basic detail
+
+    # Compound definition bonus (contains semicolons or multiple sentences)
+    if ';' in definition or len(_split_sentences(definition)) > 1:
+        score += 10
+
+    # POS reliability bonus
+    if pos in ['noun', 'verb', 'adjective', 'adverb']:
+        score += 8
+    elif pos in ['pronoun', 'preposition', 'conjunction']:
+        score += 6
+    elif pos:
+        score += 4
+
+    # Contains examples or quotes
+    if '"' in definition or '(' in definition:
+        score += 5
+
+    # Original gloss quality indicators
+    if original_gloss and len(original_gloss) > len(definition) * 1.5:
+        score += 3  # Original was much longer, likely truncated
+
+    return score
+
+
 def extract_definitions(obj: Dict[str, Any]) -> List[Tuple[Optional[str], str]]:
     """Return list of (pos, gloss) pairs from a heterogenous entry object."""
     out: List[Tuple[Optional[str], str]] = []
@@ -1121,6 +1159,9 @@ def process_baseline_mode(
     # Surname deduplication - track surname types to avoid duplicates
     seen_surname_types = set()
 
+    # Quality scoring for smart deduplication
+    definition_scores = {}  # definition -> (word, score) - track best version
+
     while True:
         line = in_f.readline()
         if not line:
@@ -1153,7 +1194,7 @@ def process_baseline_mode(
             continue
 
         # Build and store baseline defs
-        formatted: List[Tuple[int, Optional[str], str, str]] = []
+        formatted: List[Tuple[int, Optional[str], str, str, str]] = []  # Added gloss as 5th element
         seen_lines = set()
         lm_needed = False
         def_index = 0
@@ -1174,14 +1215,27 @@ def process_baseline_mode(
                     continue
                 seen_surname_types.add(surname_type)
 
-            # Global deduplication: skip if this definition already exists anywhere
-            if base_line in global_seen_definitions:
-                duplicates_skipped += 1
-                continue
+            # Smart deduplication: compare scores and keep the better definition
+            current_score = score_definition(base_line, pos_tag, gloss)
+
+            if base_line in definition_scores:
+                existing_word, existing_score = definition_scores[base_line]
+                if current_score > existing_score:
+                    # This version is better, will replace the existing one
+                    definition_scores[base_line] = (word, current_score)
+                    # Mark that we need to replace in database later
+                    duplicates_skipped += 1
+                else:
+                    # Existing version is better, skip this one
+                    duplicates_skipped += 1
+                    continue
+            else:
+                # First time seeing this definition
+                definition_scores[base_line] = (word, current_score)
             seen_lines.add(base_line)
             source_sentence = _split_sentences(clean_gloss(gloss))
             source_sentence = source_sentence[0] if source_sentence else clean_gloss(gloss)
-            formatted.append((def_index, pos_tag, source_sentence, base_line))
+            formatted.append((def_index, pos_tag, source_sentence, base_line, gloss))  # Added gloss
             def_index += 1
             if len(formatted) >= max_defs:
                 break
@@ -1193,13 +1247,15 @@ def process_baseline_mode(
         set_lm_status(conn, word, "pending" if lm_needed else "done", display_word=word)
         # Upgrade display casing if a better form is seen later (amp > Amp > AMP)
         maybe_upgrade_display_word(conn, word, word)
-        for idx, pos_tag, source_sentence, base_line in formatted:
+        for idx, pos_tag, source_sentence, base_line, gloss in formatted:
             conn.execute(
                 "INSERT OR REPLACE INTO definitions(word, idx, pos, source_first_sentence, current_line) VALUES(?,?,?,?,?)",
                 (word.lower(), idx, normalize_pos(pos_tag) if pos_tag else None, source_sentence, base_line),
             )
             # Add to global deduplication cache after successful storage
             global_seen_definitions.add(base_line)
+            # Also track in scoring system
+            definition_scores[base_line] = (word, score_definition(base_line, pos_tag, gloss))
         mark_processed(conn, word)
         processed_since_checkpoint += 1
         processed_words_total += 1
