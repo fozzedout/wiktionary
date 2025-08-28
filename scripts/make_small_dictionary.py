@@ -51,6 +51,13 @@ Cleanup tags from definitions:
     --state out/state.sqlite3 \
     --mode cleanup-tags
 
+LLM-assisted deduplication:
+  python scripts/make_small_dictionary.py \
+    --state out/state.sqlite3 \
+    --mode llm-deduplicate \
+    --lmstudio-url http://localhost:1234/v1/chat/completions \
+    --lmstudio-model your-model-name
+
 Stop anytime with Ctrl-C. Re-run with the same --state and --output to resume.
 """
 
@@ -684,6 +691,214 @@ def find_hierarchical_merge(definition: str, word_definitions: List[Tuple[int, s
             return merge_hierarchical_definitions(definition, existing_def)
 
     return None
+
+
+def calculate_semantic_similarity(def1: str, def2: str) -> float:
+    """Calculate semantic similarity between two definitions using simple heuristics."""
+    # Convert to lowercase and split into words
+    words1 = set(re.findall(r'\b\w+\b', def1.lower()))
+    words2 = set(re.findall(r'\b\w+\b', def2.lower()))
+
+    # Remove common stop words
+    stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were'}
+    words1 = words1 - stop_words
+    words2 = words2 - stop_words
+
+    if not words1 or not words2:
+        return 0.0
+
+    # Calculate Jaccard similarity
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+
+    return intersection / union if union > 0 else 0.0
+
+
+def find_potential_duplicates(definitions: List[str], threshold: float = 0.6) -> List[Tuple[int, int, float]]:
+    """Find potential duplicate pairs using semantic similarity."""
+    candidates = []
+
+    for i in range(len(definitions)):
+        for j in range(i + 1, len(definitions)):
+            similarity = calculate_semantic_similarity(definitions[i], definitions[j])
+            if similarity >= threshold:
+                candidates.append((i, j, similarity))
+
+    # Sort by similarity (highest first)
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates
+
+
+def llm_deduplicate_pair(def1: str, def2: str, word: str, pos: Optional[str] = None, llm_config: Optional[LMStudioConfig] = None) -> Dict[str, Any]:
+    """Use LLM to analyze two definitions and decide how to handle them."""
+    if not llm_config:
+        return {
+            "action": "keep_both",
+            "reason": "No LLM configuration provided",
+            "merged_definition": None
+        }
+
+    prompt = f"""Analyze these two dictionary definitions for the word "{word}"{' (' + pos + ')' if pos else ''}:
+
+Definition 1: {def1}
+Definition 2: {def2}
+
+Please respond with a JSON object containing:
+- "action": "keep_both" | "keep_first" | "keep_second" | "merge" | "combine"
+- "reason": brief explanation of your decision
+- "merged_definition": (only if action is "merge" or "combine") the combined definition
+
+Consider:
+- Are they truly different meanings or just different wordings of the same meaning?
+- Does one provide additional valuable information?
+- Would merging them create a better, more comprehensive definition?
+- Are there subtle differences that should be preserved?
+
+Respond only with the JSON object, no additional text."""
+
+    try:
+        import json
+        data = json.dumps({
+            "model": llm_config.model,
+            "messages": [
+                {"role": "system", "content": "You are a dictionary editor. Analyze definition pairs and make intelligent decisions about deduplication. Always respond with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 300
+        }).encode("utf-8")
+
+        import urllib.request
+        req = urllib.request.Request(
+            llm_config.url,
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+
+        with urllib.request.urlopen(req, timeout=llm_config.timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            obj = json.loads(raw)
+
+            if "choices" in obj and obj["choices"]:
+                content = obj["choices"][0].get("message", {}).get("content", "")
+                content = strip_llm_artifacts(content.strip())
+
+                # Try to parse JSON response
+                try:
+                    result = json.loads(content)
+                    return result
+                except json.JSONDecodeError:
+                    # Fallback: extract JSON from response
+                    import re
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group(0))
+                        return result
+
+        return {
+            "action": "keep_both",
+            "reason": "Could not parse LLM response",
+            "merged_definition": None
+        }
+
+    except Exception as e:
+        return {
+            "action": "keep_both",
+            "reason": f"Error in LLM analysis: {str(e)}",
+            "merged_definition": None
+        }
+
+
+def process_llm_deduplication(conn: sqlite3.Connection, llm_config: Optional[LMStudioConfig], batch_size: int = 10) -> int:
+    """Process definitions using LLM-assisted deduplication."""
+    if not llm_config:
+        print("LLM configuration required for llm-deduplicate mode")
+        return 1
+
+    print("Starting LLM-assisted deduplication...")
+
+    # Get all words with multiple definitions
+    cur = conn.execute("""
+        SELECT word, COUNT(*) as def_count
+        FROM definitions
+        GROUP BY word
+        HAVING def_count > 1
+        ORDER BY def_count DESC
+    """)
+
+    words_with_multiple_defs = cur.fetchall()
+    total_processed = 0
+    total_deduplicated = 0
+
+    for word, def_count in words_with_multiple_defs:
+        # Get all definitions for this word
+        cur_defs = conn.execute(
+            "SELECT idx, current_line FROM definitions WHERE word = ? ORDER BY idx",
+            (word,)
+        )
+        definitions = cur_defs.fetchall()
+
+        if len(definitions) < 2:
+            continue
+
+        # Extract just the definition texts
+        def_texts = [def_text for _, def_text in definitions]
+
+        # Find potential duplicates
+        candidates = find_potential_duplicates(def_texts, threshold=0.5)
+
+        if not candidates:
+            continue
+
+        print(f"Processing {word}: {len(definitions)} definitions, {len(candidates)} candidates")
+
+        # Process candidates in batches
+        for i in range(0, len(candidates), batch_size):
+            batch = candidates[i:i+batch_size]
+
+            for idx1, idx2, similarity in batch:
+                def1 = def_texts[idx1]
+                def2 = def_texts[idx2]
+
+                # Skip if already processed or identical
+                if def1 == def2:
+                    continue
+
+                # Use LLM to analyze the pair
+                result = llm_deduplicate_pair(def1, def2, word, None, llm_config)
+
+                if result["action"] in ["keep_first", "merge", "combine"]:
+                    # Remove the second definition
+                    conn.execute(
+                        "DELETE FROM definitions WHERE word = ? AND idx = ?",
+                        (word, definitions[idx2][0])
+                    )
+                    total_deduplicated += 1
+
+                    if result["action"] in ["merge", "combine"] and result["merged_definition"]:
+                        # Update the first definition with merged version
+                        conn.execute(
+                            "UPDATE definitions SET current_line = ? WHERE word = ? AND idx = ?",
+                            (result["merged_definition"], word, definitions[idx1][0])
+                        )
+
+                elif result["action"] == "keep_second":
+                    # Remove the first definition
+                    conn.execute(
+                        "DELETE FROM definitions WHERE word = ? AND idx = ?",
+                        (word, definitions[idx1][0])
+                    )
+                    total_deduplicated += 1
+
+                # Commit every 100 operations
+                total_processed += 1
+                if total_processed % 100 == 0:
+                    conn.commit()
+                    print(f"Processed {total_processed} pairs, deduplicated {total_deduplicated}")
+
+    conn.commit()
+    print(f"LLM deduplication complete: {total_deduplicated} definitions removed/modified")
+    return 0
 
 
 def extract_definitions(obj: Dict[str, Any]) -> List[Tuple[Optional[str], str]]:
@@ -2058,6 +2273,27 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         return 0
 
+    if args.mode == "llm-deduplicate":
+        # LLM-assisted deduplication for complex cases
+        if not args.state:
+            sys.stderr.write("llm-deduplicate mode requires --state\n")
+            return 2
+
+        conn = connect_state(args.state)
+
+        # Get LLM configuration
+        lm_cfg = None
+        if args.lmstudio_url and args.lmstudio_model:
+            lm_cfg = LMStudioConfig(
+                url=args.lmstudio_url,
+                model=args.lmstudio_model,
+                timeout=float(getattr(args, "lm_timeout", 120.0) or 120.0)
+            )
+
+        result = process_llm_deduplication(conn, lm_cfg)
+        conn.close()
+        return result
+
     if args.mode == "cleanup-tags":
         # Remove all tags from current_line in definitions
         import re
@@ -2097,7 +2333,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--input", help="Input JSONL file")
     p.add_argument("--state", help="SQLite state DB path")
     p.add_argument("--output", help="Output path for export")
-    p.add_argument("--mode", choices=["baseline","enhance","export","verify","verify-lm","manual-review","extract-pure-words","generate-pure-db","cleanup-tags"], default="baseline")
+    p.add_argument("--mode", choices=["baseline","enhance","export","verify","verify-lm","manual-review","extract-pure-words","generate-pure-db","cleanup-tags","llm-deduplicate"], default="baseline")
     p.add_argument("--lmstudio-url", help="LM Studio URL")
     p.add_argument("--lmstudio-model", help="LM Studio model")
     p.add_argument("--lm-timeout", type=int, default=120)
@@ -2323,9 +2559,10 @@ def _tui(config_path: str) -> int:
         print('10) Extract pure words')
         print('11) Generate pure words DB')
         print('12) Cleanup tags from definitions')
-        print('13) Quit')
+        print('13) LLM-assisted deduplication')
+        print('14) Quit')
         try:
-            choice = input('Select an option [1-13]: ').strip()
+            choice = input('Select an option [1-14]: ').strip()
         except KeyboardInterrupt:
             return 0
 
@@ -2570,6 +2807,18 @@ def _tui(config_path: str) -> int:
             _press_enter(); continue
 
         if choice == '13':
+            sel = _select_llm(cfg)
+            if not sel:
+                _press_enter(); continue
+            url, model = sel
+            try:
+                rc = main(['--state', cfg.get('state'), '--mode', 'llm-deduplicate', '--lmstudio-url', url, '--lmstudio-model', model])
+                print(f'LLM deduplication finished with code {rc}')
+            except SystemExit as se:
+                print(f'LLM deduplication exited: {se}')
+            _press_enter(); continue
+
+        if choice == '14':
             print('Bye.')
             return 0
 
