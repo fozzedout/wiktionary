@@ -1,0 +1,7 @@
+*.sqlite3*
+*.jsonl
+*.txt
+
+__pycache__/
+out/
+scripts/
