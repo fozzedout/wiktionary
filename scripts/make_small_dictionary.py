@@ -1113,6 +1113,13 @@ def process_baseline_mode(
     # Progress counters
     last_progress_time = time.time()
     processed_words_total = 0
+    duplicates_skipped = 0
+
+    # Global deduplication cache - track all seen definitions across all words
+    global_seen_definitions = set()
+
+    # Surname deduplication - track surname types to avoid duplicates
+    seen_surname_types = set()
 
     while True:
         line = in_f.readline()
@@ -1159,6 +1166,18 @@ def process_baseline_mode(
                 continue
             if base_line in seen_lines:
                 continue
+            # Surname deduplication: avoid storing duplicate surname definitions
+            if "surname" in base_line.lower():
+                surname_type = base_line.lower().strip()
+                if surname_type in seen_surname_types:
+                    duplicates_skipped += 1
+                    continue
+                seen_surname_types.add(surname_type)
+
+            # Global deduplication: skip if this definition already exists anywhere
+            if base_line in global_seen_definitions:
+                duplicates_skipped += 1
+                continue
             seen_lines.add(base_line)
             source_sentence = _split_sentences(clean_gloss(gloss))
             source_sentence = source_sentence[0] if source_sentence else clean_gloss(gloss)
@@ -1179,6 +1198,8 @@ def process_baseline_mode(
                 "INSERT OR REPLACE INTO definitions(word, idx, pos, source_first_sentence, current_line) VALUES(?,?,?,?,?)",
                 (word.lower(), idx, normalize_pos(pos_tag) if pos_tag else None, source_sentence, base_line),
             )
+            # Add to global deduplication cache after successful storage
+            global_seen_definitions.add(base_line)
         mark_processed(conn, word)
         processed_since_checkpoint += 1
         processed_words_total += 1
@@ -1195,7 +1216,7 @@ def process_baseline_mode(
                 pending = curp.fetchone()[0]
                 curd = conn.execute("SELECT COUNT(*) FROM words WHERE status='done';")
                 done = curd.fetchone()[0]
-                sys.stderr.write("\r" + f"Baseline: line={total_read} words={done+pending} done={done} pending={pending}")
+                sys.stderr.write("\r" + f"Baseline: line={total_read} words={done+pending} done={done} pending={pending} dups={duplicates_skipped}")
                 sys.stderr.flush()
                 last_progress_time = now
         except Exception:
@@ -1207,6 +1228,7 @@ def process_baseline_mode(
     in_f.close()
     try:
         sys.stderr.write("\n")
+        sys.stderr.write(f"Baseline complete: {duplicates_skipped} duplicates skipped during import\n")
         sys.stderr.flush()
     except Exception:
         pass
