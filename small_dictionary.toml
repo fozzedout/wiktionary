@@ -1,0 +1,22 @@
+{
+  "state": "out/state.sqlite3",
+  "input": "raw-wiktextract-data.jsonl",
+  "output": "out/small_dictionary.final.jsonl",
+  "max_defs": 5,
+  "max_words": 100,
+  "checkpoint": 100,
+  "lm_timeout": 120,
+  "fast": {
+    "url": "localhost",
+    "model": "qwen/qwen3-4b-2507"
+  },
+  "balanced": {
+    "url": "localhost",
+    "model": "google/gemma-3n-e4b"
+  },
+  "verify": {
+    "url": "localhost",
+    "model": "openai/gpt-oss-20b"
+  },
+  "initialized": true
+}

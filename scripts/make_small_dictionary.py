@@ -2254,7 +2254,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # If no CLI args provided, drop into the built-in TUI to configure and run
     no_args = (argv is None and len(sys.argv) <= 1) or (isinstance(argv, list) and len(argv) == 0)
     if no_args:
-        return _tui(getattr(args, "config", "out/small_dictionary.toml"))
+        return _tui(getattr(args, "config", "small_dictionary.toml"))
 
     # Fill defaults from config if missing
     if not args.state:
@@ -2635,7 +2635,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--only-reprocess", action="store_true")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--verify-sample", type=int, default=0, help="Only verify a sample of N definitions (0 = all)")
-    p.add_argument("--config", help="Path to config toml", default="out/small_dictionary.toml")
+    p.add_argument("--config", help="Path to config toml", default="small_dictionary.toml")
     return p.parse_args(argv)
 
 
