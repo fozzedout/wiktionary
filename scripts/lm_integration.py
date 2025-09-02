@@ -26,6 +26,24 @@ class LMStudioConfig:
         self.model = model
         self.timeout = timeout
 
+    @property
+    def full_url(self) -> str:
+        """Construct the full API URL from the base URL."""
+        base_url = self.url.strip()
+        # If it's already a full URL with /v1/, return as-is
+        if '/v1/' in base_url:
+            return base_url
+        # If it starts with http, assume it's a complete URL
+        if base_url.startswith(('http://', 'https://')):
+            return base_url
+        # Otherwise, construct the full URL with standard path
+        if ':' in base_url:
+            # Has port (e.g., "localhost:1234")
+            return f"http://{base_url}/v1/chat/completions"
+        else:
+            # Just hostname/IP, add default port
+            return f"http://{base_url}:1234/v1/chat/completions"
+
 
 def _evaluate_definition_quality(gloss: str, cfg: LMStudioConfig) -> bool:
     """Ask LLM to evaluate if a definition is helpful or just describes notation/formula."""
@@ -51,7 +69,7 @@ def _evaluate_definition_quality(gloss: str, cfg: LMStudioConfig) -> bool:
 
     try:
         data = json.dumps(payload).encode("utf-8")
-        req = _urllib.Request(cfg.url, data=data, headers={"Content-Type": "application/json"})
+        req = _urllib.Request(cfg.full_url, data=data, headers={"Content-Type": "application/json"})
         with _urllib.urlopen(req, timeout=cfg.timeout) as resp:
             raw = resp.read().decode("utf-8")
             obj = json.loads(raw)
@@ -134,11 +152,11 @@ def summarize_with_lmstudio(
 
     # Inform the user we're about to call the LLM
     try:
-        sys.stderr.write(f"[info] Calling LLM at {cfg.url} (model={cfg.model})...\n")
+        sys.stderr.write(f"[info] Calling LLM at {cfg.full_url} (model={cfg.model})...\n")
         sys.stderr.flush()
     except Exception:
         pass
-    req = _urllib.Request(cfg.url, data=data, headers={"Content-Type": "application/json"})
+    req = _urllib.Request(cfg.full_url, data=data, headers={"Content-Type": "application/json"})
     try:
         with _urllib.urlopen(req, timeout=cfg.timeout) as resp:  # type: ignore[attr-defined]
             raw = resp.read().decode("utf-8")
@@ -213,7 +231,7 @@ def verify_with_lmstudio(cfg: LMStudioConfig, *,
     }
     # No max_tokens limit for any model - let them complete naturally
     data = json.dumps(payload).encode("utf-8")
-    req = _urllib.Request(cfg.url, data=data, headers={"Content-Type": "application/json"})
+    req = _urllib.Request(cfg.full_url, data=data, headers={"Content-Type": "application/json"})
     try:
         with _urllib.urlopen(req, timeout=cfg.timeout) as resp:  # type: ignore[attr-defined]
             raw = resp.read().decode("utf-8")
@@ -288,7 +306,7 @@ def warm_up_model(cfg: LMStudioConfig, *, temperature: Optional[float] = None, m
     reported_model: Optional[str] = None
     while True:
         data = json.dumps(payload).encode("utf-8")
-        req = _urllib.Request(cfg.url, data=data, headers={"Content-Type": "application/json"})
+        req = _urllib.Request(cfg.full_url, data=data, headers={"Content-Type": "application/json"})
         try:
             with _urllib.urlopen(req, timeout=cfg.timeout) as resp:  # type: ignore[attr-defined]
                 raw = resp.read().decode("utf-8")

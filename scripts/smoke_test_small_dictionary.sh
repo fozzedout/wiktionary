@@ -35,7 +35,7 @@ python scripts/make_small_dictionary.py \
   --input "$INPUT" \
   --state "$STATE" \
   --mode baseline \
-  --max-defs 5 \
+  # --max-defs removed (unlimited definitions) \
   --checkpoint-interval 50
 
 echo "Exporting consolidated JSONL to: $OUT"
@@ -71,7 +71,7 @@ if [[ -n "${LMSTUDIO_URL:-}" && -n "${LMSTUDIO_MODEL:-}" ]]; then
     --mode enhance \
     --lmstudio-url "$LMSTUDIO_URL" \
     --lmstudio-model "$LMSTUDIO_MODEL" \
-    --max-defs 5 \
+  # --max-defs removed (unlimited definitions) \
     --checkpoint-interval 20
 
   echo "Exporting LM-enhanced JSONL to: $OUT_LM"

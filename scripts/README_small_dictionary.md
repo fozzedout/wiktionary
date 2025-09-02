@@ -25,7 +25,6 @@ Phases & Run
       --input data/snippet.jsonl \
       --state out/state.sqlite3 \
       --mode baseline \
-      --max-defs 5 \
       --checkpoint-interval 100
 
 - Enhance with LM Studio (OpenAI-compatible API):
@@ -33,8 +32,7 @@ Phases & Run
     --state out/state.sqlite3 \
     --mode enhance \
     --lmstudio-url http://localhost:1234/v1/chat/completions \
-    --lmstudio-model qwen/qwen3-4b-2507 \
-    --max-defs 5
+    --lmstudio-model qwen/qwen3-4b-2507
   # To only enhance items explicitly marked for reprocessing (e.g., by verify-lm):
   python scripts/make_small_dictionary.py \
     --state out/state.sqlite3 \
