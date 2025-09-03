@@ -1556,8 +1556,19 @@ def process_baseline_mode(
         word = extract_word(obj)
         if not word:
             continue
-        if is_processed(conn, word):
-            continue
+        # Do not skip words already seen: Wiktextract often emits one object per POS.
+        # Instead, load any existing defs for this word so we can merge additional POS entries.
+        existing_rows = conn.execute(
+            "SELECT idx, pos, source_first_sentence, current_line FROM definitions WHERE word=? ORDER BY idx ASC;",
+            (word.lower(),)
+        ).fetchall()
+        # Seed seen lines with what's already in DB to avoid duplicates
+        existing_lines = {r[3] for r in existing_rows}
+        # Continue indexing after the last existing idx
+        next_def_index = (max((r[0] for r in existing_rows), default=-1) + 1) if existing_rows else 0
+        # Seed per-word merge tracking if this is the first time we see the word in this run
+        if word not in word_definitions and existing_rows:
+            word_definitions[word] = [(r[0], r[3]) for r in existing_rows]
         defs = extract_definitions(obj)
         # Skip words that are misspelling entries in the baseline import.
         # Wiktextract often tags misspelling senses with a tag or puts
@@ -1595,9 +1606,9 @@ def process_baseline_mode(
 
         # Build and store baseline defs
         formatted: List[Tuple[int, Optional[str], str, str, str]] = []  # Added gloss as 5th element
-        seen_lines = set()
+        seen_lines = set(existing_lines)
         lm_needed = False
-        def_index = 0
+        def_index = next_def_index
         for pos_tag, gloss in defs:
             base_line = format_def_line(pos_tag, gloss, max_words_per_def) or ""
             if first_sentence_word_count(gloss) > max_words_per_def:
@@ -1674,7 +1685,10 @@ def process_baseline_mode(
             continue
 
         # Persist word and defs (current_line initially baseline)
-        set_lm_status(conn, word, "pending" if lm_needed else "done", display_word=word)
+        # If the word already exists, only upgrade status to 'pending' if needed.
+        prev_status = get_lm_status(conn, word)
+        new_status = "pending" if (lm_needed or prev_status == "pending") else "done"
+        set_lm_status(conn, word, new_status, display_word=word)
         # Upgrade display casing if a better form is seen later (amp > Amp > AMP)
         maybe_upgrade_display_word(conn, word, word)
         for idx, pos_tag, source_sentence, base_line, gloss in formatted:
