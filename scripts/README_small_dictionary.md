@@ -27,19 +27,35 @@ Phases & Run
       --mode baseline \
       --checkpoint-interval 100
 
-- Enhance with LM Studio (OpenAI-compatible API):
-  python scripts/make_small_dictionary.py \
-    --state out/state.sqlite3 \
-    --mode enhance \
-    --lmstudio-url http://localhost:1234/v1/chat/completions \
-    --lmstudio-model qwen/qwen3-4b-2507
-  # To only enhance items explicitly marked for reprocessing (e.g., by verify-lm):
-  python scripts/make_small_dictionary.py \
-    --state out/state.sqlite3 \
-    --mode enhance \
-    --only-reprocess \
-    --lmstudio-url http://localhost:1234/v1/chat/completions \
-    --lmstudio-model qwen/qwen3-4b-2507
+   - Enhance with LM Studio (OpenAI-compatible API):
+   python scripts/make_small_dictionary.py \
+     --state out/state.sqlite3 \
+     --mode enhance \
+     --lmstudio-url http://localhost:1234/v1/chat/completions \
+     --lmstudio-model qwen/qwen3-4b-2507
+   # To only enhance items explicitly marked for reprocessing (e.g., by verify-lm):
+   python scripts/make_small_dictionary.py \
+     --state out/state.sqlite3 \
+     --mode enhance \
+     --only-reprocess \
+     --lmstudio-url http://localhost:1234/v1/chat/completions \
+     --lmstudio-model qwen/qwen3-4b-2507
+   # Variant: Cycle through all remaining items with increasing temperatures before switching models:
+   python scripts/make_small_dictionary.py \
+     --state out/state.sqlite3 \
+     --mode enhance \
+     --only-reprocess \
+     --cycle-temps-first \
+     --lmstudio-url http://localhost:1234/v1/chat/completions \
+     --lmstudio-model qwen/qwen3-4b-2507
+   # Variant: Have LLM verify entry suitability before retrying:
+   python scripts/make_small_dictionary.py \
+     --state out/state.sqlite3 \
+     --mode enhance \
+     --only-reprocess \
+     --verify-before-retry \
+     --lmstudio-url http://localhost:1234/v1/chat/completions \
+     --lmstudio-model qwen/qwen3-4b-2507
 
   - Report progress (counts only):
     python scripts/make_small_dictionary.py --state out/state.sqlite3 --mode report --input dummy --output dummy
@@ -70,8 +86,11 @@ Notes
 - Deduplication is case-insensitive (e.g., "Raven" and "raven" are considered the same word key).
 - In baseline mode, no LM calls are made.
 - In enhance mode, only words marked "pending" are sent to LM; results are updated in-place in the `definitions` table.
-- Use `--only-reprocess` to restrict enhance to words that were explicitly flagged for reprocessing (tracked via an internal `reprocess` flag). The `verify-lm` mode sets this flag when it finds issues.
-- Checkpointing is by input line number; on resume, the script skips that many lines before continuing.
+ - Use `--only-reprocess` to restrict enhance to words that were explicitly flagged for reprocessing (tracked via an internal `reprocess` flag). The `verify-lm` mode sets this flag when it finds issues.
+ - Use `--cycle-temps-first` to cycle through all remaining items with increasing temperatures before switching to the next model. This can help improve results by trying different temperature levels across all items.
+ - Use `--verify-before-retry` to have the LLM verify entry suitability before retrying or moving on. This adds an extra validation step to ensure retries are worthwhile.
+ - These variant options are also available in the TUI (option 5) where you can interactively choose whether to enable them.
+ - Checkpointing is by input line number; on resume, the script skips that many lines before continuing.
 
 Verification
 - Rule-based verify summary (no LLM):

@@ -1742,6 +1742,8 @@ def process_enhance_mode(
     only_reprocess: bool,
     temperature: Optional[float],
     enable_web_search: bool = True,
+    cycle_temps_first: bool = False,
+    verify_before_retry: bool = False,
 ) -> None:
     """Process dictionary entries in enhance mode using LLM."""
     if not use_lmstudio:
@@ -1749,7 +1751,7 @@ def process_enhance_mode(
         return
 
     # Debug: Check enable_web_search value
-    print(f"[debug] process_enhance_mode: enable_web_search={enable_web_search}, only_reprocess={only_reprocess}")
+
 
     processed_since_checkpoint = 0
     last_progress_time = time.time()
@@ -1811,9 +1813,9 @@ def process_enhance_mode(
                                     context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
                                     web_context_local = " | ".join(context_parts) if context_parts else None
                                     search_results_local = stored_results
-                                    print(f"[cache] Using cached web results for '{word}' (definition {idx}) - {len(stored_results)} results")
+                                    print(f"[CACHE] Using cached web results for '{word}' (definition {idx}) - {len(stored_results)} results")
                                 else:
-                                    print(f"[cache] Found metadata but no stored results for '{word}' (definition {idx})")
+                                    print(f"[CACHE] Found metadata but no stored results for '{word}' (definition {idx})")
                                     has_recent_search = False  # Force fresh search
                             else:
                                 print(f"[web] No cached results for '{word}' (definition {idx}), will search if needed")
@@ -1847,6 +1849,20 @@ def process_enhance_mode(
                         # Get the pre-prepared web context for this definition
                         web_context_local = web_contexts.get(idx)
                         search_results_local = search_results_cache.get(idx, [])
+
+                        # If verify_before_retry is enabled, check if the entry is suitable for retry
+                        if verify_before_retry and attempt > 0:
+                            valid, reason = verify_with_lmstudio(
+                                use_lmstudio,
+                                source_sentence=source_sentence,
+                                candidate_line=current_line,
+                                expected_pos=pos_tag,
+                                max_words=max_words_per_def,
+                                temperature=current_temp
+                            )
+                            if not valid:
+                                print(f"[verify] Skipping retry for '{word}' (definition {idx}): {reason}")
+                                continue
 
                         # Enhance with current temperature
                         result = summarize_with_lmstudio(
@@ -1885,34 +1901,164 @@ def process_enhance_mode(
 
             return False
 
-        for w in words:
-            enhanced_any = enhance_with_retry(w)
-            attempted += 1
-            if enhanced_any:
-                set_lm_status(conn, w, "done")
-                set_reprocess_flag(conn, w, False)
-                succeeded += 1
-            else:
-                set_lm_status(conn, w, "pending")
-                set_reprocess_flag(conn, w, True)
-                failed += 1
+        if cycle_temps_first:
+            # Cycle through all remaining items with increasing temperatures before switching to next model
+            print(f"[variant] Cycle temps first: processing {len(words)} words with temperature escalation")
+            max_cycles = 5  # Maximum number of temperature cycles
+            base_temp = temperature if temperature is not None else 0.1
 
-            processed_since_checkpoint += 1
-            processed_words_total += 1
+            for cycle in range(max_cycles):
+                cycle_temp = min(base_temp + (cycle * 0.2), 1.0)
+                print(f"[variant] Cycle {cycle + 1}/{max_cycles} with temperature {cycle_temp}")
 
-            if processed_since_checkpoint >= checkpoint_interval:
-                conn.commit()
-                processed_since_checkpoint = 0
+                words_processed_this_cycle = 0
+                words_succeeded_this_cycle = 0
 
-            # Progress update
-            try:
-                now = time.time()
-                if now - last_progress_time >= 1.0:
-                    sys.stderr.write(f"\rEnhance (reprocess): attempted={attempted} succeeded={succeeded} failed={failed}")
-                    sys.stderr.flush()
-                    last_progress_time = now
-            except Exception:
-                pass
+                for w in words:
+                    # Skip words that have already been successfully enhanced
+                    current_status = get_lm_status(conn, w)
+                    if current_status == "done":
+                        continue
+
+                    # Enhance with current cycle temperature
+                    enhanced_any = False
+
+                    try:
+                        # Get word definitions
+                        curd = conn.execute(
+                            "SELECT idx, pos, source_first_sentence, current_line FROM definitions WHERE word=? ORDER BY idx ASC;",
+                            (w,)
+                        )
+                        rows = curd.fetchall()
+                        if not rows:
+                            continue  # No definitions to enhance
+
+                        # Pre-process definitions for web context (once per word per cycle)
+                        web_contexts = {}
+                        search_results_cache = {}
+
+                        for idx, pos_tag, source_sentence, current_line in rows:
+                            if _word_count(source_sentence) <= max_words_per_def:
+                                continue  # Already short enough
+
+                            web_context_local = None
+                            search_results_local: List[Dict[str, Any]] = []
+
+                            if enable_web_search:
+                                has_recent_search = has_recent_search_results(conn, w, idx)
+                                if has_recent_search:
+                                    stored_results = get_stored_search_results(conn, w, idx)
+                                    if stored_results:
+                                        context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
+                                        web_context_local = " | ".join(context_parts) if context_parts else None
+                                        search_results_local = stored_results
+
+                            web_contexts[idx] = web_context_local
+                            search_results_cache[idx] = search_results_local
+
+                        # Process definitions with current cycle temperature
+                        for idx, pos_tag, source_sentence, current_line in rows:
+                            if _word_count(source_sentence) <= max_words_per_def:
+                                continue  # Already short enough
+
+                            web_context_local = web_contexts.get(idx)
+                            search_results_local = search_results_cache.get(idx, [])
+
+                            # If verify_before_retry is enabled, check suitability
+                            if verify_before_retry and cycle > 0:
+                                valid, reason = verify_with_lmstudio(
+                                    use_lmstudio,
+                                    source_sentence=source_sentence,
+                                    candidate_line=current_line,
+                                    expected_pos=pos_tag,
+                                    max_words=max_words_per_def,
+                                    temperature=cycle_temp
+                                )
+                                if not valid:
+                                    print(f"[verify] Skipping '{w}' (definition {idx}) in cycle {cycle + 1}: {reason}")
+                                    continue
+
+                            # Enhance with cycle temperature
+                            result = summarize_with_lmstudio(
+                                use_lmstudio,
+                                pos_tag,
+                                source_sentence,
+                                max_words_per_def,
+                                temperature=cycle_temp,
+                                web_context_override=web_context_local,
+                                search_results_override=search_results_local,
+                                enable_web_search=enable_web_search,
+                            )
+
+                            if result:
+                                new_line, enhanced_source, search_results = result
+                                if (new_line and
+                                    new_line != source_sentence and
+                                    _word_count(new_line) <= max_words_per_def + 15 and
+                                    len(new_line.strip()) > 10):
+
+                                    conn.execute(
+                                        "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
+                                        (new_line, enhanced_source, w, idx),
+                                    )
+                                    enhanced_any = True
+
+                        if enhanced_any:
+                            set_lm_status(conn, w, "done")
+                            set_reprocess_flag(conn, w, False)
+                            words_succeeded_this_cycle += 1
+
+                    except Exception as e:
+                        continue
+
+                    words_processed_this_cycle += 1
+                    attempted += 1
+
+                print(f"[variant] Cycle {cycle + 1} completed: {words_processed_this_cycle} processed, {words_succeeded_this_cycle} succeeded")
+
+                # If no words were successfully enhanced in this cycle, break early
+                if words_succeeded_this_cycle == 0:
+                    print(f"[variant] No improvements in cycle {cycle + 1}, stopping early")
+                    break
+
+            # Final count update
+            for w in words:
+                current_status = get_lm_status(conn, w)
+                if current_status == "done":
+                    succeeded += 1
+                else:
+                    failed += 1
+
+        else:
+            # Original behavior: process each word once with retries
+            for w in words:
+                enhanced_any = enhance_with_retry(w)
+                attempted += 1
+                if enhanced_any:
+                    set_lm_status(conn, w, "done")
+                    set_reprocess_flag(conn, w, False)
+                    succeeded += 1
+                else:
+                    set_lm_status(conn, w, "pending")
+                    set_reprocess_flag(conn, w, True)
+                    failed += 1
+
+                processed_since_checkpoint += 1
+                processed_words_total += 1
+
+                if processed_since_checkpoint >= checkpoint_interval:
+                    conn.commit()
+                    processed_since_checkpoint = 0
+
+                # Progress update
+                try:
+                    now = time.time()
+                    if now - last_progress_time >= 1.0:
+                        sys.stderr.write(f"\rEnhance (reprocess): attempted={attempted} succeeded={succeeded} failed={failed}")
+                        sys.stderr.flush()
+                        last_progress_time = now
+                except Exception:
+                    pass
 
         conn.commit()
         try:
@@ -2131,6 +2277,8 @@ def process_file(
     only_reprocess: bool = False,
     temperature: Optional[float] = None,
     output_path: Optional[str] = None,
+    cycle_temps_first: bool = False,
+    verify_before_retry: bool = False,
 ) -> None:
 
     conn = connect_state(state_path)
@@ -2146,7 +2294,7 @@ def process_file(
         # For option 3 (enhance pending): disable web search for speed
         # For option 5 (enhance reprocess-only): enable web search for thoroughness
         enable_web_search = only_reprocess  # True for reprocess-only, False for regular enhance
-        process_enhance_mode(conn, use_lmstudio, max_words_per_def, checkpoint_interval, only_reprocess, temperature, enable_web_search)
+        process_enhance_mode(conn, use_lmstudio, max_words_per_def, checkpoint_interval, only_reprocess, temperature, enable_web_search, cycle_temps_first, verify_before_retry)
 
     elif mode == "export":
         # Export consolidated JSONL to stdout or to --output if provided
@@ -2310,7 +2458,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         process_file(args.input, args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=None, mode="baseline", output_path=args.output)
         return 0
     if args.mode == "enhance":
-        process_file(args.input or "", args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=lm_cfg, mode="enhance", only_reprocess=getattr(args, "only_reprocess", False), temperature=getattr(args, "temperature", None), output_path=args.output)
+        process_file(args.input or "", args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=lm_cfg, mode="enhance", only_reprocess=getattr(args, "only_reprocess", False), temperature=getattr(args, "temperature", None), output_path=args.output, cycle_temps_first=getattr(args, "cycle_temps_first", False), verify_before_retry=getattr(args, "verify_before_retry", False))
         return 0
     if args.mode == "export":
         process_file(args.input or "", args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=None, mode="export", output_path=args.output)
@@ -2647,6 +2795,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-words", type=int, default=25)
     p.add_argument("--checkpoint-interval", type=int, default=100)
     p.add_argument("--only-reprocess", action="store_true")
+    p.add_argument("--cycle-temps-first", action="store_true", help="Cycle through all remaining items with increasing temperatures before switching to next model")
+    p.add_argument("--verify-before-retry", action="store_true", help="Have LLM verify entry suitability before retrying or moving on")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--verify-sample", type=int, default=0, help="Only verify a sample of N definitions (0 = all)")
     p.add_argument("--config", help="Path to config toml", default="small_dictionary.toml")
@@ -2949,7 +3099,7 @@ def _tui(config_path: str) -> int:
         print('2) Baseline (build from input JSONL)')
         print('3) Enhance pending (LM)')
         print('4) Verify (LM)')
-        print('5) Enhance (reprocess-only)')
+        print('5) Enhance (reprocess-only) - with variant options')
         print('6) Manual review')
         print('7) Export (final JSONL)')
         print('8) Compact DB (create a compact copy)')
@@ -3089,11 +3239,23 @@ def _tui(config_path: str) -> int:
             sel = _select_llm(cfg)
             if not sel: _press_enter(); continue
             url, model = sel
+
+            # Ask about variant options
+            print("\nVariant Options:")
+            cycle_temps = _confirm("Use cycle temps first (process all items with increasing temperatures)?", default=False)
+            verify_before = _confirm("Verify entry suitability before retrying?", default=False)
+
             # Warm up model before running reprocess-only enhancement
             ok, elapsed, rmodel = warm_up_model(LMStudioConfig(url=url, model=model), temperature=None)
             print(f'Warm-up: ok={ok} elapsed={elapsed:.1f}s model={rmodel or model}')
+
             try:
-                rc = main(['--state', cfg.get('state'), '--mode', 'enhance', '--only-reprocess', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout'))])
+                args_list = ['--state', cfg.get('state'), '--mode', 'enhance', '--only-reprocess', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout'))]
+                if cycle_temps:
+                    args_list.append('--cycle-temps-first')
+                if verify_before:
+                    args_list.append('--verify-before-retry')
+                rc = main(args_list)
                 print(f'Enhance (reprocess-only) finished with code {rc}')
             except SystemExit as se:
                 print(f'Enhance exited: {se}')

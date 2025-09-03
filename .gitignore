@@ -1,6 +1,8 @@
 *.sqlite3*
 *.jsonl
 *.txt
+*.log
 
 __pycache__/
 out/
+scripts/make_small_dictionary.py
