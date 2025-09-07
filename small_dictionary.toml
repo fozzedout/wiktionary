@@ -18,5 +18,6 @@
     "url": "localhost",
     "model": "openai/gpt-oss-20b"
   },
-  "initialized": true
+  "initialized": true,
+  "max_retry_count": 20
 }
