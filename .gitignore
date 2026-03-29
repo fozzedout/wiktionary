@@ -4,5 +4,7 @@
 *.log
 
 __pycache__/
+node_modules/
+.wrangler/
 out/
 scripts/make_small_dictionary.py

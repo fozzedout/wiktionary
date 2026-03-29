@@ -1,0 +1,28 @@
+name = "dictionary-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Bind to a custom domain for the shared dictionary API
+# routes = [
+#   { pattern = "dict-api.yourdomain.com/*", zone_name = "yourdomain.com" }
+# ]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dictionary-db"
+# Create with: npx wrangler d1 create dictionary-db
+# Then paste the database_id here
+database_id = "d160b4c8-8a48-46aa-ab29-dfbaf07e8692"
+
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = false
+
+[vars]
+# Rate limit: requests per minute per API key
+RATE_LIMIT_RPM = "600"
+# API key for the built-in front-end tester
+FRONTEND_TEST_KEY = "SfkaUrcy5cI4Xp_JI83swi-t1Tty56h8od2HCWlKb8E"
+# For local dev; in production use: npx wrangler secret put API_KEYS
+API_KEYS = "SfkaUrcy5cI4Xp_JI83swi-t1Tty56h8od2HCWlKb8E"

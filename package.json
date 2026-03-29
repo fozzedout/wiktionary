@@ -1,0 +1,17 @@
+{
+  "name": "wiktionary-dictionary-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:trie": "node scripts/build-trie.mjs --input out/pure-words.txt --out out/words-trie --format bin",
+    "build:all": "bash scripts/build-all.sh",
+    "deploy:db": "bash scripts/deploy-db.sh",
+    "deploy:worker": "cd worker && npx wrangler deploy",
+    "deploy:trie": "bash scripts/deploy-trie.sh",
+    "deploy:all": "bash scripts/deploy-all.sh"
+  },
+  "devDependencies": {
+    "wrangler": "^4.30.0"
+  }
+}

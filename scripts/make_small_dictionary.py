@@ -1510,7 +1510,11 @@ def process_baseline_mode(
 ) -> None:
     """Process dictionary entries in baseline mode."""
     # Open and stream input; store results in DB only.
-    in_f = open(input_path, "r", encoding="utf-8", errors="replace")
+    import gzip as _gzip_mod
+    if input_path.endswith('.gz'):
+        in_f = _gzip_mod.open(input_path, 'rt', encoding='utf-8', errors='replace')
+    else:
+        in_f = open(input_path, "r", encoding="utf-8", errors="replace")
     # Skip already processed lines
     for _ in range(line_offset):
         if not in_f.readline():
