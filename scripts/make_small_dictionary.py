@@ -5,10 +5,9 @@ Resumable JSONL -> small dictionary builder.
 Features:
 - Reads a large JSONL of dictionary entries (use your snippet to test).
 - Emits compact definitions per unique word, e.g.: "_adjective_ Of the color of the raven, jet-black."
-- Limits each definition line to <= 25 words.
 - Two-phase workflow:
-  - baseline: stream the large JSONL once, store compact baseline defs in SQLite, mark LM status per word.
-  - enhance: without scanning the large file, read pending words from SQLite, use LM to refine into <= 25 words, store enhanced defs, mark done.
+  - baseline: stream the large JSONL once, store first-sentence defs in SQLite, mark LM status per word.
+  - enhance: without scanning the large file, read pending words from SQLite, use LM to compress all defs for a word into a total word budget, store enhanced defs, mark done.
 - Optional export mode to write a final JSONL from the DB.
 - Extract pure words: filter words that are single whole words (no spaces, hyphens, apostrophes, etc.)
 - Generate pure words DB: create new database with only pure words and their definitions.
@@ -579,15 +578,14 @@ def sanity_check_line(source_sentence: str, candidate_line: str, max_words: int,
     return ok
 
 
-def format_def_line(pos: Optional[str], gloss: str, max_words: int) -> Optional[str]:
+def format_def_line(pos: Optional[str], gloss: str, max_words: int = 0) -> Optional[str]:
     g = clean_gloss(gloss)
     if not g:
         return None
     # Prefer first sentence; fall back to whole gloss
     first = _split_sentences(g)[0] if _split_sentences(g) else g
-    first = _limit_words(first, max_words)
-    # Remove POS prefix requirement - just return the formatted definition
-    return first
+    # Return full first sentence; truncation is handled by the LLM enhance pass
+    return first.strip()
 
 
 def first_sentence_word_count(gloss: str) -> int:
@@ -1292,6 +1290,123 @@ def summarize_with_lmstudio(
     return None
 
 
+def summarize_all_definitions(
+    cfg: LMStudioConfig,
+    word: str,
+    definitions: List[Tuple[int, Optional[str], str]],  # (idx, pos, source_first_sentence)
+    max_total_words: int,
+    *,
+    temperature: Optional[float] = None,
+    verbose: bool = False,
+) -> Optional[List[Tuple[int, Optional[str], str]]]:
+    """Send all definitions for a word to the LLM and get back compressed versions.
+
+    Returns list of (idx, pos, shortened_definition) or None on failure.
+    The LLM may merge or drop definitions to fit within the total word budget.
+    """
+    if _urllib is None:
+        return None
+
+    # Build the input for the LLM
+    def_entries = []
+    for idx, pos, text in definitions:
+        entry: Dict[str, Any] = {"idx": idx, "definition": text}
+        if pos:
+            entry["pos"] = pos
+        def_entries.append(entry)
+
+    input_json = json.dumps({"word": word, "definitions": def_entries}, ensure_ascii=False)
+
+    prompt = (
+        f"You are a dictionary editor. Compress all definitions for a word to fit within "
+        f"{max_total_words} words total across ALL definitions combined.\n"
+        "Rules:\n"
+        "- Keep each definition as a separate entry\n"
+        "- You may merge near-duplicate definitions into one\n"
+        "- You may drop the least useful definitions if needed to fit the budget\n"
+        "- Preserve the part-of-speech (pos) field exactly as given\n"
+        "- Be concise but accurate — keep the core meaning\n"
+        "- Return a JSON array: [{\"idx\": 0, \"pos\": \"noun\", \"definition\": \"...\"}, ...]\n"
+        "- Output ONLY the JSON array, nothing else"
+    )
+
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": input_json},
+        ],
+        "temperature": 0.3 if temperature is None else float(temperature),
+        "max_tokens": max(max_total_words * 8, 400),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = _urllib.Request(cfg.full_url, data=data, headers={"Content-Type": "application/json"})
+
+    try:
+        with _urllib.urlopen(req, timeout=cfg.timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            obj = json.loads(raw)
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return None
+            text = (choices[0].get("message") or {}).get("content", "")
+            if not text:
+                if verbose:
+                    print(f"[debug] Empty LLM response for '{word}'")
+                return None
+            raw_text = text.strip()
+
+            # Parse JSON array from response — try direct parse, then extract from surrounding text
+            result_array = None
+            try:
+                result_array = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # Try to extract JSON array from the text
+                match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+                if match:
+                    try:
+                        result_array = json.loads(match.group())
+                    except json.JSONDecodeError:
+                        pass
+
+            if not isinstance(result_array, list) or not result_array:
+                if verbose:
+                    print(f"[debug] Failed to parse JSON for '{word}'. Response: {raw_text[:200]}")
+                return None
+
+            # Validate and extract results
+            valid_idxs = {idx for idx, _, _ in definitions}
+            results: List[Tuple[int, Optional[str], str]] = []
+            for item in result_array:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("idx")
+                defn = item.get("definition", "").strip()
+                pos = item.get("pos")
+                if idx not in valid_idxs or not defn:
+                    continue
+                results.append((idx, pos, defn))
+
+            if not results:
+                if verbose:
+                    print(f"[debug] No valid entries for '{word}'. Parsed array: {result_array[:2]}... valid_idxs={valid_idxs}")
+                return None
+
+            # Check total word count — allow some tolerance
+            total_words = sum(_word_count(d) for _, _, d in results)
+            if total_words > max_total_words * 1.5:
+                if verbose:
+                    print(f"[warn] LLM result for '{word}' too long: {total_words} words (budget {max_total_words})")
+                return None
+
+            return results
+
+    except Exception as e:
+        if verbose:
+            print(f"[error] summarize_all_definitions for '{word}': {e}")
+        return None
+
+
 def format_eta(elapsed: float, progress: float) -> str:
     """Format ETA based on elapsed time and progress (0.0 to 1.0)."""
     if progress <= 0:
@@ -1619,12 +1734,9 @@ def process_baseline_mode(
         # Build and store baseline defs
         formatted: List[Tuple[int, Optional[str], str, str, str]] = []  # Added gloss as 5th element
         seen_lines = set(existing_lines)
-        lm_needed = False
         def_index = next_def_index
         for pos_tag, gloss in defs:
-            base_line = format_def_line(pos_tag, gloss, max_words_per_def) or ""
-            if first_sentence_word_count(gloss) > max_words_per_def:
-                lm_needed = True
+            base_line = format_def_line(pos_tag, gloss) or ""
             base_line = base_line.strip()
             if not base_line:
                 continue
@@ -1698,6 +1810,10 @@ def process_baseline_mode(
 
         # Persist word and defs (current_line initially baseline)
         # If the word already exists, only upgrade status to 'pending' if needed.
+        # Check total word count across all definitions to decide if LLM enhancement is needed
+        total_def_words = sum(_word_count(bl) for _, _, _, bl, _ in formatted)
+        existing_def_words = sum(_word_count(r[3]) for r in existing_rows) if existing_rows else 0
+        lm_needed = (total_def_words + existing_def_words) > max_words_per_def
         prev_status = get_lm_status(conn, word)
         new_status = "pending" if (lm_needed or prev_status == "pending") else "done"
         set_lm_status(conn, word, new_status, display_word=word)
@@ -1749,27 +1865,23 @@ def process_baseline_mode(
 def process_enhance_mode(
     conn: sqlite3.Connection,
     use_lmstudio: LMStudioConfig,
-    max_words_per_def: int,
+    max_total_words: int,
     checkpoint_interval: int,
     only_reprocess: bool,
     temperature: Optional[float],
     enable_web_search: bool = True,
     verbose: bool = False,
 ) -> None:
-    """Process dictionary entries in enhance mode using LLM."""
+    """Process dictionary entries in enhance mode using whole-word LLM compression."""
     if not use_lmstudio:
         sys.stderr.write("Enhance mode requires LM Studio configuration.\n")
         return
-
-    # Debug: Check enable_web_search value
-
 
     processed_since_checkpoint = 0
     last_progress_time = time.time()
     processed_words_total = 0
 
     if only_reprocess:
-        # Snapshot once and process each exactly once
         cur = conn.execute(
             "SELECT word FROM words WHERE status='pending' AND reprocess=1 ORDER BY word ASC;"
         )
@@ -1778,281 +1890,45 @@ def process_enhance_mode(
         succeeded = 0
         failed = 0
 
-        def enhance_with_retry(word, max_retries=5):
-            """Enhance a word with temperature escalation and quality checking."""
-            print(f"[debug] Starting enhance_with_retry for '{word}'")
-            base_temp = temperature if temperature is not None else 0.1
+        base_temp = temperature if temperature is not None else 0.3
+        max_retries = 3
+
+        for w in words:
+            if get_lm_status(conn, w) == "done":
+                continue
+
+            attempted += 1
+            enhanced = False
 
             for attempt in range(max_retries):
-                # Increase temperature with each retry for more variety
                 current_temp = min(base_temp + (attempt * 0.2), 1.0)
-
                 try:
-                    # Get word definitions
-                    curd = conn.execute(
-                        "SELECT idx, pos, source_first_sentence, current_line FROM definitions WHERE word=? ORDER BY idx ASC;",
-                        (word,)
+                    enhanced = process_single_word_enhancement(
+                        conn, w, use_lmstudio, max_total_words, current_temp,
+                        enable_web_search=enable_web_search, verbose=verbose,
                     )
-                    rows = curd.fetchall()
-
-                    if not rows:
-                        return False  # No definitions to enhance
-
-                    enhanced_any = False
-
-                    # Pre-process all definitions to check for cached results and prepare web context
-                    # This happens once per word, not per retry attempt
-                    web_contexts = {}
-                    search_results_cache = {}
-
-                    for idx, pos_tag, source_sentence, current_line in rows:
-                        if _word_count(source_sentence) <= max_words_per_def:
-                            continue  # Already short enough
-
-                        # Check if we have recent search results (avoid redundant searches)
-                        web_context_local = None
-                        search_results_local: List[Dict[str, Any]] = []
-
-                        if enable_web_search:
-                            has_recent_search = has_recent_search_results(conn, word, idx)
-
-                            if has_recent_search:
-                                # Use cached search results
-                                stored_results = get_stored_search_results(conn, word, idx)
-                                if stored_results:
-                                    # Combine stored search results into context
-                                    context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
-                                    web_context_local = " | ".join(context_parts) if context_parts else None
-                                    search_results_local = stored_results
-                                    print(f"[CACHE] Using cached web results for '{word}' (definition {idx}) - {len(stored_results)} results")
-                                else:
-                                    print(f"[CACHE] Found metadata but no stored results for '{word}' (definition {idx})")
-                                    has_recent_search = False  # Force fresh search
-                            else:
-                                print(f"[web] No cached results for '{word}' (definition {idx}), will search if needed")
-
-                            if not has_recent_search:
-                                # Perform fresh search only if no recent results
-                                # Use fast quality check instead of expensive LLM evaluation
-                                is_helpful_local = _fast_quality_check(source_sentence)
-                                if not is_helpful_local:
-                                    term_match_local = re.search(r'^([A-Za-z][A-Za-z0-9\s-]+)', source_sentence)
-                                    search_term_local = term_match_local.group(1).strip() if term_match_local else word
-                                    print(f"[web] Searching for '{search_term_local}' to enhance '{word}' (definition {idx})")
-                                    web_context_local, search_results_local = _search_web_for_context(search_term_local, pos_tag)
-                                    if search_results_local:
-                                        store_search_results(conn, word, idx, search_term_local, ["duckduckgo", "wikipedia"], search_results_local)
-                                        print(f"[web] Stored {len(search_results_local)} search results for '{word}' (definition {idx})")
-                                    else:
-                                        print(f"[web] No search results found for '{word}' (definition {idx})")
-                        else:
-                            print(f"[skip] Web search disabled for '{word}' (definition {idx})")
-
-                        # Store the prepared context for this definition
-                        web_contexts[idx] = web_context_local
-                        search_results_cache[idx] = search_results_local
-
-                    # Now process all definitions with prepared contexts
-                    for idx, pos_tag, source_sentence, current_line in rows:
-                        if _word_count(source_sentence) <= max_words_per_def:
-                            continue  # Already short enough
-
-                        # Get the pre-prepared web context for this definition
-                        web_context_local = web_contexts.get(idx)
-                        search_results_local = search_results_cache.get(idx, [])
-
-                        # check if the entry is suitable for retry
-                        valid, reason = verify_with_lmstudio(
-                            use_lmstudio,
-                            source_sentence=source_sentence,
-                            candidate_line=current_line,
-                            expected_pos=pos_tag,
-                            max_words=max_words_per_def,
-                            temperature=current_temp
-                        )
-                        if not valid:
-                            print(f"[verify] Skipping retry for '{word}' (definition {idx}): {reason}")
-                            continue
-
-                        # Enhance with current temperature
-                        result = summarize_with_lmstudio(
-                            use_lmstudio,
-                            pos_tag,
-                            source_sentence,
-                            max_words_per_def,
-                            temperature=current_temp,
-                            web_context_override=web_context_local,
-                            search_results_override=search_results_local,
-                            enable_web_search=enable_web_search,
-                            verbose=verbose,
-                        )
-
-                        if result:
-                            new_line, enhanced_source, search_results = result
-
-                            # Quality check: ensure it's different and reasonable length
-                            if (new_line and
-                                new_line != source_sentence and
-                                _word_count(new_line) <= max_words_per_def + 3 and  # Allow some flexibility
-                                len(new_line.strip()) > 10):  # Not too short
-
-                                conn.execute(
-                                    "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
-                                    (new_line, enhanced_source, word, idx),
-                                )
-                                enhanced_any = True
-
-                    return enhanced_any
-
+                    if enhanced:
+                        break
                 except Exception as e:
-                    print(f"Attempt {attempt + 1} failed for '{word}': {e}")
-                    if attempt == max_retries - 1:
-                        return False  # All attempts failed
-                    continue
+                    if verbose:
+                        print(f"Attempt {attempt + 1} failed for '{w}': {e}")
 
-            return False
-
-        # Cycle through all remaining items with increasing temperatures before switching to next model
-        if verbose:
-            print(f"[variant] Cycle temps first: processing {len(words)} words with temperature escalation")
-        max_cycles = 5  # Maximum number of temperature cycles
-        base_temp = temperature if temperature is not None else 0.1
-
-        for cycle in range(max_cycles):
-            cycle_temp = min(base_temp + (cycle * 0.2), 1.0)
-            if verbose:
-                print(f"[variant] Cycle {cycle + 1}/{max_cycles} with temperature {cycle_temp}")
-
-            words_processed_this_cycle = 0
-            words_succeeded_this_cycle = 0
-
-            for w in words:
-                # Skip words that have already been successfully enhanced
-                current_status = get_lm_status(conn, w)
-                if current_status == "done":
-                    continue
-
-                # Enhance with current cycle temperature
-                enhanced_any = False
-
-                try:
-                    # Get word definitions
-                    curd = conn.execute(
-                        "SELECT idx, pos, source_first_sentence, current_line FROM definitions WHERE word=? ORDER BY idx ASC;",
-                        (w,)
-                    )
-                    rows = curd.fetchall()
-                    if not rows:
-                        continue  # No definitions to enhance
-
-                    # Pre-process definitions for web context (once per word per cycle)
-                    web_contexts = {}
-                    search_results_cache = {}
-
-                    for idx, pos_tag, source_sentence, current_line in rows:
-                        if _word_count(source_sentence) <= max_words_per_def:
-                            continue  # Already short enough
-
-                        web_context_local = None
-                        search_results_local: List[Dict[str, Any]] = []
-
-                        if enable_web_search:
-                            has_recent_search = has_recent_search_results(conn, w, idx)
-                            if has_recent_search:
-                                stored_results = get_stored_search_results(conn, w, idx)
-                                if stored_results:
-                                    context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
-                                    web_context_local = " | ".join(context_parts) if context_parts else None
-                                    search_results_local = stored_results
-
-                        web_contexts[idx] = web_context_local
-                        search_results_cache[idx] = search_results_local
-
-                    # Process definitions with current cycle temperature
-                    for idx, pos_tag, source_sentence, current_line in rows:
-                        if _word_count(source_sentence) <= max_words_per_def:
-                            continue  # Already short enough
-
-                        web_context_local = web_contexts.get(idx)
-                        search_results_local = search_results_cache.get(idx, [])
-
-                        # check suitability
-                        if cycle > 0:
-                            valid, reason = verify_with_lmstudio(
-                                use_lmstudio,
-                                source_sentence=source_sentence,
-                                candidate_line=current_line,
-                                expected_pos=pos_tag,
-                                max_words=max_words_per_def,
-                                temperature=cycle_temp
-                            )
-                            if not valid:
-                                print(f"[verify] Skipping '{w}' (definition {idx}) in cycle {cycle + 1}: {reason}")
-                                continue
-
-                        # Enhance with cycle temperature
-                        result = summarize_with_lmstudio(
-                            use_lmstudio,
-                            pos_tag,
-                            source_sentence,
-                            max_words_per_def,
-                            temperature=cycle_temp,
-                            web_context_override=web_context_local,
-                            search_results_override=search_results_local,
-                            enable_web_search=enable_web_search,
-                            verbose=verbose,
-                        )
-
-                        if result:
-                            new_line, enhanced_source, search_results = result
-                            if (new_line and
-                                new_line != source_sentence and
-                                _word_count(new_line) <= max_words_per_def + 15 and
-                                len(new_line.strip()) > 10):
-
-                                conn.execute(
-                                    "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
-                                    (new_line, enhanced_source, w, idx),
-                                )
-                                enhanced_any = True
-
-                    if enhanced_any:
-                        set_lm_status(conn, w, "done")
-                        set_reprocess_flag(conn, w, False)
-                        words_succeeded_this_cycle += 1
-
-                except Exception as e:
-                    continue
-
-                words_processed_this_cycle += 1
-                attempted += 1
-
-            if verbose:
-                print(f"[variant] Cycle {cycle + 1} completed: {words_processed_this_cycle} processed, {words_succeeded_this_cycle} succeeded")
-
-            # If no words were successfully enhanced in this cycle, break early
-            if words_succeeded_this_cycle == 0:
-                if verbose:
-                    print(f"[variant] No improvements in cycle {cycle + 1}, stopping early")
-                break
-
-        # Final count update
-        for w in words:
-            current_status = get_lm_status(conn, w)
-            if current_status == "done":
+            if enhanced:
+                set_lm_status(conn, w, "done")
+                set_reprocess_flag(conn, w, False)
                 succeeded += 1
             else:
                 failed += 1
 
+            processed_since_checkpoint += 1
+            if processed_since_checkpoint >= checkpoint_interval:
+                conn.commit()
+                processed_since_checkpoint = 0
+
         conn.commit()
         try:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        try:
             sys.stderr.write(
-                f"Enhanced summary (reprocess-only): attempted={attempted} succeeded={succeeded} failed={failed}\n"
+                f"\nEnhanced summary (reprocess-only): attempted={attempted} succeeded={succeeded} failed={failed}\n"
             )
             sys.stderr.flush()
         except Exception:
@@ -2087,7 +1963,7 @@ def process_enhance_mode(
 
                 # Process current word
                 enhanced_any = process_single_word_enhancement(
-                    conn, word, use_lmstudio, max_words_per_def, temperature, enable_web_search, verbose
+                    conn, word, use_lmstudio, max_total_words, temperature, enable_web_search, verbose
                 )
                 set_lm_status(conn, word, "done")
                 set_reprocess_flag(conn, word, False)
@@ -2125,140 +2001,75 @@ def process_single_word_enhancement(
     conn: sqlite3.Connection,
     word: str,
     use_lmstudio: LMStudioConfig,
-    max_words_per_def: int,
+    max_total_words: int,
     temperature: Optional[float],
     enable_web_search: bool = True,
     verbose: bool = False,
 ) -> bool:
-    """Enhance a single word's definitions using LLM."""
+    """Enhance all definitions for a word using a single LLM call with a total word budget."""
     curd = conn.execute(
         "SELECT idx, pos, source_first_sentence, current_line FROM definitions WHERE word=? ORDER BY idx ASC;",
         (word,),
     )
     rows = curd.fetchall()
-    enhanced_any = False
+    if not rows:
+        return False
 
-    for idx, pos_tag, source_sentence, current_line in rows:
-        if _word_count(source_sentence) > max_words_per_def:
-            # Check if we have recent cached search results first
-            web_context_local = None
-            search_results_local: List[Dict[str, Any]] = []
-
-            # Debug: Check if we have cached results
-            has_cached = has_recent_search_results(conn, word, idx)
-            print(f"[debug] Checking cache for '{word}' (idx={idx}): {has_cached}")
-
-            if has_cached:
-                # Use cached search results
-                stored_results = get_stored_search_results(conn, word, idx)
-                if stored_results:
-                    # Combine stored search results into context
-                    context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
-                    web_context_local = " | ".join(context_parts) if context_parts else None
-                    search_results_local = stored_results
-                    print(f"[cache] Using cached search results for '{word}' (definition {idx})")
-                else:
-                    print(f"[debug] No stored results found for '{word}' (idx={idx})")
-            elif enable_web_search:
-                # No cached results, perform fresh search
-                term_match_local = re.search(r'^([A-Za-z][A-Za-z0-9\s-]+)', source_sentence)
-                search_term_local = term_match_local.group(1).strip() if term_match_local else word
-                web_context_local, search_results_local = _search_web_for_context(search_term_local, pos_tag)
-                if search_results_local:
-                    store_search_results(conn, word, idx, search_term_local, ["duckduckgo", "wikipedia"], search_results_local)
-                    if verbose:
-                        print(f"[web] Performed fresh search for '{word}' (definition {idx})")
-
-                result = summarize_with_lmstudio(
-                    use_lmstudio,
-                    pos_tag,
-                    source_sentence,
-                    max_words_per_def,
-                    temperature=temperature,
-                    web_context_override=web_context_local,
-                    search_results_override=search_results_local,
-                    enable_web_search=enable_web_search,
-                    verbose=verbose,
-                )
-                new_line = None
-                enhanced_source = None
-                search_results = []
-
-                if result:
-                    new_line, enhanced_source, search_results = result
-                    if new_line:
-                        new_line = strip_llm_artifacts(new_line)
-
-                # Store the enhanced result
-                result_to_store = new_line if new_line else source_sentence
+    # Check if total words already fit the budget
+    total_words = sum(_word_count(r[2]) for r in rows)  # source_first_sentence
+    if total_words <= max_total_words:
+        # Already fits — copy source to current_line as-is
+        for idx, pos_tag, source_sentence, current_line in rows:
+            if current_line != source_sentence:
                 conn.execute(
-                    "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
-                    (result_to_store, enhanced_source, word, idx),
+                    "UPDATE definitions SET current_line=? WHERE word=? AND idx=?",
+                    (source_sentence, word, idx),
                 )
+        return True
 
-                # Store search results if we have any
-                if search_results:
-                    term_match = re.search(r'^([A-Za-z][A-Za0-9\s-]+)', source_sentence)
-                    search_term = term_match.group(1).strip() if term_match else word
-                    store_search_results(conn, word, idx, search_term, ["duckduckgo", "wikipedia"], search_results)
+    # Build input for whole-word LLM compression
+    all_defs = [(idx, pos_tag, source_sentence) for idx, pos_tag, source_sentence, _ in rows]
 
-                # Mark as enhanced if the result passed sanity checks
-                if new_line and sanity_check_line(source_sentence, new_line, max_words_per_def, pos_tag):
-                    enhanced_any = True
-            else:
-                # Use existing search results to enhance
-                stored_results = get_stored_search_results(conn, word, idx)
-                if stored_results:
-                    # Combine stored search results into context
-                    context_parts = [r["snippet"] for r in stored_results if r.get("snippet", "").strip()]
-                    web_context = " | ".join(context_parts) if context_parts else None
+    result = summarize_all_definitions(
+        use_lmstudio,
+        word,
+        all_defs,
+        max_total_words,
+        temperature=temperature,
+        verbose=verbose,
+    )
 
-                    if web_context:
-                        # Re-run LLM with stored context
-                        result = summarize_with_lmstudio(
-                            use_lmstudio,
-                            pos_tag,
-                            source_sentence,
-                            max_words_per_def,
-                            temperature=temperature,
-                            web_context_override=web_context,
-                            search_results_override=stored_results,
-                            enable_web_search=enable_web_search,
-                            verbose=verbose,
-                        )
-                        new_line = None
-                        enhanced_source = None
-                        search_results = []
+    if not result:
+        if verbose:
+            print(f"[fail] LLM returned no result for '{word}' ({len(rows)} defs, {total_words} words)")
+        return False
 
-                        if result:
-                            new_line, enhanced_source, search_results = result
-                            if new_line:
-                                new_line = strip_llm_artifacts(new_line)
+    # Apply results: update definitions that were returned, delete ones that were dropped
+    returned_idxs = {idx for idx, _, _ in result}
+    all_idxs = {idx for idx, _, _, _ in rows}
 
-                        result_to_store = new_line if new_line else source_sentence
-                        conn.execute(
-                            "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
-                            (result_to_store, enhanced_source, word, idx),
-                        )
+    for idx, pos, new_def in result:
+        conn.execute(
+            "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
+            (new_def, "whole_word_v1", word, idx),
+        )
 
-                        if new_line and sanity_check_line(source_sentence, new_line, max_words_per_def, pos_tag):
-                            enhanced_any = True
-        else:
-            # Source is <= max_words_per_def, use as-is
-            conn.execute(
-                "UPDATE definitions SET current_line=?, enhanced_source=? WHERE word=? AND idx=?",
-                (source_sentence, None, word, idx),
-            )
-            enhanced_any = True
+    # Delete dropped definitions
+    dropped = all_idxs - returned_idxs
+    if dropped:
+        for idx in dropped:
+            conn.execute("DELETE FROM definitions WHERE word=? AND idx=?", (word, idx))
+        if verbose:
+            print(f"[drop] '{word}': dropped {len(dropped)} definitions to fit budget")
 
-    return enhanced_any
+    return True
 
 
 def process_file(
     input_path: str,
     state_path: str,
     max_defs: int,
-    max_words_per_def: int,
+    max_total_words: int,
     checkpoint_interval: int,
     use_lmstudio: Optional[LMStudioConfig] = None,
     mode: str = "baseline",
@@ -2272,7 +2083,7 @@ def process_file(
     line_offset = get_line_offset(conn)
 
     if mode == "baseline":
-        process_baseline_mode(conn, input_path, max_defs, max_words_per_def, checkpoint_interval, line_offset)
+        process_baseline_mode(conn, input_path, max_defs, max_total_words, checkpoint_interval, line_offset)
 
     elif mode == "enhance":
         if use_lmstudio is None:
@@ -2281,7 +2092,7 @@ def process_file(
         # For option 3 (enhance pending): disable web search for speed
         # For option 5 (enhance reprocess-only): enable web search for thoroughness
         enable_web_search = only_reprocess  # True for reprocess-only, False for regular enhance
-        process_enhance_mode(conn, use_lmstudio, max_words_per_def, checkpoint_interval, only_reprocess, temperature, enable_web_search, verbose)
+        process_enhance_mode(conn, use_lmstudio, max_total_words, checkpoint_interval, only_reprocess, temperature, enable_web_search, verbose)
 
     elif mode == "export":
         # Export consolidated JSONL to stdout or to --output if provided
@@ -2398,6 +2209,9 @@ def _select_llm(cfg: Dict[str, Any], *, default_tier: str = "fast") -> Optional[
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Resolve deprecated --max-words to --max-total-words
+    if args.max_words is not None:
+        args.max_total_words = args.max_words
     # Config fallback: load defaults from TOML if present
     cfg = _load_simple_toml(getattr(args, "config", "")) if getattr(args, "config", None) else {}
     # If no CLI args provided, drop into the built-in TUI to configure and run
@@ -2408,6 +2222,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Fill defaults from config if missing
     if not args.state:
         args.state = str(cfg.get("state") or "out/state.sqlite3")
+    # Load max_total_words from config (supports old 'max_words' key too)
+    if args.max_words is None and args.max_total_words == 100:
+        cfg_total = cfg.get("max_total_words") or cfg.get("max_words")
+        if cfg_total is not None:
+            args.max_total_words = int(cfg_total)
     if args.mode == "baseline" and not args.input and cfg.get("input"):
         args.input = str(cfg.get("input"))
     if args.mode == "export" and not args.output and cfg.get("output"):
@@ -2442,13 +2261,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Dispatch modes
     if args.mode == "baseline":
-        process_file(args.input, args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=None, mode="baseline", output_path=args.output)
+        process_file(args.input, args.state, args.max_defs, args.max_total_words, args.checkpoint_interval, use_lmstudio=None, mode="baseline", output_path=args.output)
         return 0
     if args.mode == "enhance":
-        process_file(args.input or "", args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=lm_cfg, mode="enhance", only_reprocess=getattr(args, "only_reprocess", False), temperature=getattr(args, "temperature", None), output_path=args.output, verbose=getattr(args, "verbose", False))
+        process_file(args.input or "", args.state, args.max_defs, args.max_total_words, args.checkpoint_interval, use_lmstudio=lm_cfg, mode="enhance", only_reprocess=getattr(args, "only_reprocess", False), temperature=getattr(args, "temperature", None), output_path=args.output, verbose=getattr(args, "verbose", False))
         return 0
     if args.mode == "export":
-        process_file(args.input or "", args.state, args.max_defs, args.max_words, args.checkpoint_interval, use_lmstudio=None, mode="export", output_path=args.output)
+        process_file(args.input or "", args.state, args.max_defs, args.max_total_words, args.checkpoint_interval, use_lmstudio=None, mode="export", output_path=args.output)
         return 0
     if args.mode == "verify-lm":
         # LM-based verification: verify ALL definitions for complete coverage
@@ -2490,7 +2309,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             processed_definitions += 1
 
             # Handle short definitions (auto-valid)
-            if word_count <= args.max_words:
+            if word_count <= args.max_total_words:
                 short_definitions += 1
                 continue
 
@@ -2500,7 +2319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 source_sentence=src_text,
                 candidate_line=line_text,
                 expected_pos=pos,
-                max_words=args.max_words,
+                max_words=args.max_total_words,
                 temperature=getattr(args, "temperature", None)
             )
 
@@ -2572,12 +2391,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             checked += 1
 
             # Handle short definitions (auto-valid)
-            if word_count <= args.max_words:
+            if word_count <= args.max_total_words:
                 short_definitions += 1
                 continue
 
             # Rule-based validation for longer definitions
-            ok, reason = sanity_check_line_with_reason(src_text, line_text, args.max_words, pos)
+            ok, reason = sanity_check_line_with_reason(src_text, line_text, args.max_total_words, pos)
             rule_validated += 1
 
             if not ok:
@@ -2623,6 +2442,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Create new database with custom schema (not using connect_state to avoid default tables)
         ensure_parent_dir(args.output)
+        if os.path.exists(args.output):
+            os.remove(args.output)
         new_conn = sqlite3.connect(args.output)
         new_conn.execute("PRAGMA journal_mode=WAL;")
         new_conn.execute("PRAGMA synchronous=NORMAL;")
@@ -2779,7 +2600,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--lmstudio-model", help="LM Studio model")
     p.add_argument("--lm-timeout", type=int, default=120)
     p.add_argument("--max-defs", type=int, default=5)
-    p.add_argument("--max-words", type=int, default=25)
+    p.add_argument("--max-total-words", type=int, default=100)
+    p.add_argument("--max-words", type=int, default=None, help="Deprecated alias for --max-total-words")
     p.add_argument("--checkpoint-interval", type=int, default=100)
     p.add_argument("--only-reprocess", action="store_true")
     p.add_argument("--temperature", type=float, default=None)
@@ -3073,7 +2895,7 @@ def _tui(config_path: str) -> int:
     cfg.setdefault('input', cfg.get('input', ''))
     cfg.setdefault('output', cfg.get('output', 'out/small_dictionary.final.jsonl'))
     cfg.setdefault('max_defs', cfg.get('max_defs', 5))
-    cfg.setdefault('max_words', cfg.get('max_words', 25))
+    cfg.setdefault('max_total_words', cfg.get('max_total_words', cfg.get('max_words', 100)))
     cfg.setdefault('checkpoint', cfg.get('checkpoint', 100))
     cfg.setdefault('lm_timeout', cfg.get('lm_timeout', 120))
 
@@ -3107,7 +2929,7 @@ def _tui(config_path: str) -> int:
             cfg['output'] = _ask('Export JSONL path', cfg.get('output'))
             try:
                 cfg['max_defs'] = int(_ask('Max defs per word', str(cfg.get('max_defs', 5))))
-                cfg['max_words'] = int(_ask('Max words per def', str(cfg.get('max_words', 25))))
+                cfg['max_total_words'] = int(_ask('Max total words (budget across all defs)', str(cfg.get('max_total_words', 100))))
                 cfg['checkpoint'] = int(_ask('Checkpoint interval', str(cfg.get('checkpoint', 100))))
                 cfg['lm_timeout'] = int(_ask('LM HTTP timeout (seconds)', str(cfg.get('lm_timeout', 120))))
             except Exception:
@@ -3143,7 +2965,7 @@ def _tui(config_path: str) -> int:
             print('\nStarting baseline...')
             print(f"Input: {inp}\nState DB: {cfg.get('state')}")
             try:
-                rc = main(['--input', inp, '--state', cfg.get('state'), '--mode', 'baseline', '--max-defs', str(cfg.get('max_defs')), '--max-words', str(cfg.get('max_words')), '--checkpoint-interval', str(cfg.get('checkpoint'))])
+                rc = main(['--input', inp, '--state', cfg.get('state'), '--mode', 'baseline', '--max-defs', str(cfg.get('max_defs')), '--max-total-words', str(cfg.get('max_total_words', 100)), '--checkpoint-interval', str(cfg.get('checkpoint'))])
                 print(f'Baseline finished with code {rc}')
             except SystemExit as se:
                 print(f'Baseline exited: {se}')
@@ -3179,7 +3001,7 @@ def _tui(config_path: str) -> int:
 
             # proceed with enhancement
             try:
-                args_list = ['--state', cfg.get('state'), '--mode', 'enhance', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout')), '--max-defs', str(cfg.get('max_defs')), '--max-words', str(cfg.get('max_words')), '--checkpoint-interval', str(cfg.get('checkpoint'))]
+                args_list = ['--state', cfg.get('state'), '--mode', 'enhance', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout')), '--max-defs', str(cfg.get('max_defs')), '--max-total-words', str(cfg.get('max_total_words', 100)), '--checkpoint-interval', str(cfg.get('checkpoint'))]
                 if temp is not None:
                     args_list += ['--temperature', str(temp)]
                 rc = main(args_list)
@@ -3216,7 +3038,7 @@ def _tui(config_path: str) -> int:
                 continue  # Warm-up failed, back to menu
 
             try:
-                args_list = ['--state', cfg.get('state'), '--mode', 'verify-lm', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout')), '--max-words', str(cfg.get('max_words'))]
+                args_list = ['--state', cfg.get('state'), '--mode', 'verify-lm', '--lmstudio-url', url, '--lmstudio-model', model, '--lm-timeout', str(cfg.get('lm_timeout')), '--max-total-words', str(cfg.get('max_total_words', 100))]
                 if sample_n:
                     args_list += ['--verify-sample', str(sample_n)]
                 rc = main(args_list)
@@ -3249,7 +3071,7 @@ def _tui(config_path: str) -> int:
             if sel:
                 url, model = sel
                 lm_cfg = LMStudioConfig(url=url, model=model)
-            manual_review_entries(cfg.get('state'), max_words=cfg.get('max_words', 25), use_lm_validation=lm_cfg)
+            manual_review_entries(cfg.get('state'), max_words=cfg.get('max_total_words', 100), use_lm_validation=lm_cfg)
             _press_enter(); continue
 
         if choice == '7':
@@ -3308,7 +3130,7 @@ def _tui(config_path: str) -> int:
             except Exception:
                 sample_n = 0
             try:
-                rc = main(['--state', cfg.get('state'), '--mode', 'verify', '--max-words', str(cfg.get('max_words')), '--verify-sample', str(sample_n) if sample_n else '0'])
+                rc = main(['--state', cfg.get('state'), '--mode', 'verify', '--max-total-words', str(cfg.get('max_total_words', 100)), '--verify-sample', str(sample_n) if sample_n else '0'])
                 print(f'Rule-based verify finished with code {rc}')
             except SystemExit as se:
                 print(f'Verify exited: {se}')

@@ -3,7 +3,7 @@
   "input": "raw-wiktextract-data.jsonl.gz",
   "output": "out/small_dictionary.final.jsonl",
   "max_defs": 5,
-  "max_words": 33,
+  "max_total_words": 100,
   "checkpoint": 100,
   "lm_timeout": 120,
   "fast": {

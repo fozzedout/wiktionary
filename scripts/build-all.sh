@@ -6,9 +6,29 @@ cd "$ROOT"
 
 mkdir -p out
 
+INPUT="raw-wiktextract-data.jsonl.gz"
+URL="https://kaikki.org/dictionary/raw-wiktextract-data.jsonl.gz"
+
+echo "=== Step 0: Ensure latest Wiktionary extract ==="
+if [ -f "$INPUT" ]; then
+  echo "Local file found, checking for updates..."
+  HTTP_CODE=$(curl -sSL -o "$INPUT.tmp" -w "%{http_code}" -z "$INPUT" "$URL")
+  if [ "$HTTP_CODE" = "200" ]; then
+    mv "$INPUT.tmp" "$INPUT"
+    echo "Updated to latest version."
+  else
+    rm -f "$INPUT.tmp"
+    echo "Already up to date."
+  fi
+else
+  echo "Downloading Wiktionary extract..."
+  curl -sSL -o "$INPUT" "$URL"
+  echo "Download complete."
+fi
+
 echo "=== Step 1: Baseline (JSONL.gz -> state DB) ==="
 python scripts/make_small_dictionary.py \
-  --input raw-wiktextract-data.jsonl.gz \
+  --input "$INPUT" \
   --state out/state.sqlite3 \
   --mode baseline
 
