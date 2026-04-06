@@ -8,7 +8,7 @@
   "lm_timeout": 120,
   "fast": {
     "url": "localhost",
-    "model": "qwen/qwen3-4b-2507"
+    "model": "qwen3.5-4b"
   },
   "balanced": {
     "url": "localhost",

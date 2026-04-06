@@ -261,6 +261,16 @@ async function main() {
     console.log(`Wrote ${path.basename(binPath)} and ${path.basename(changeExt(outPath, '.json'))}`);
   }
 
+  // Write manifest with extract metadata for stage-1 pipeline integration
+  const manifest = {
+    ...meta,
+    trieBinaryFilename: path.basename(changeExt(outPath, '.bin')),
+    inputFile: inputPath,
+  };
+  const manifestPath = changeExt(outPath, '.manifest.json');
+  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+  console.log(`Wrote ${path.basename(manifestPath)}`);
+
   console.log(`Timings (ms):`, meta.timingsMs);
 }
 

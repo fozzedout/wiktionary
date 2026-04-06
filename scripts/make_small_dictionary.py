@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -88,6 +89,175 @@ def ensure_parent_dir(path: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
+
+
+# --- Stage-1: Enhancement version and hashing ---
+
+ENHANCEMENT_VERSION = "pocket_v1"
+BUILDER_VERSION = "stage1_v1"
+
+
+def normalize_for_hash(text: str) -> str:
+    """Normalize text for stable hashing: trim, collapse whitespace, strip trivial markup."""
+    s = text or ""
+    # Strip wikilinks [[word]] -> word
+    s = re.sub(r"\[\[(.*?)\]\]", r"\1", s)
+    # Strip trivial HTML/XML tags
+    s = re.sub(r"<[^>]+>", " ", s)
+    # Collapse all whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize_word_key(word: str) -> str:
+    """Canonical lowercase word key."""
+    return (word or "").strip().lower()
+
+
+def normalize_pos_for_hash(pos: Optional[str]) -> str:
+    """Normalize POS for hashing: lowercase, apply standard mapping."""
+    if not pos:
+        return ""
+    p = str(pos).strip().lower()
+    mapping = {
+        "n": "noun", "v": "verb", "adj": "adjective", "adv": "adverb",
+        "prep": "preposition", "pron": "pronoun", "det": "determiner",
+        "conj": "conjunction", "interj": "interjection", "part": "particle",
+        "num": "numeral",
+    }
+    return mapping.get(p, p)
+
+
+def hash_definition(word_key: str, pos: Optional[str], source_first_sentence: str) -> str:
+    """Compute a stable SHA-256 hash for a single source definition."""
+    nw = normalize_word_key(word_key)
+    np = normalize_pos_for_hash(pos)
+    ns = normalize_for_hash(source_first_sentence)
+    payload = f"{nw}\0{np}\0{ns}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hash_word(word_key: str, display_word: Optional[str], definition_hashes: List[str]) -> str:
+    """Compute a stable SHA-256 hash for a word based on its definitions."""
+    nw = normalize_word_key(word_key)
+    nd = normalize_for_hash(display_word or word_key)
+    # Sort definition hashes for determinism
+    sorted_hashes = sorted(definition_hashes)
+    payload = f"{nw}\0{nd}\0" + "\0".join(sorted_hashes)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hash_extract_file(file_path: str) -> str:
+    """Compute SHA-256 over the raw file contents."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)  # 1MB chunks
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stable_def_id(base_word_key: str) -> int:
+    """Deterministic integer ID for a base word, stable across exports.
+
+    Uses first 7 bytes of SHA-256 as a positive integer (56 bits).
+    Collision probability for 500k base words is ~0.00001%.
+    """
+    h = hashlib.sha256(base_word_key.encode("utf-8")).digest()
+    return int.from_bytes(h[:7], "big")
+
+
+def make_definition_key(word_key: str, pos: Optional[str], source_first_sentence: str) -> str:
+    """Create a short stable key for a definition (first 16 chars of its hash)."""
+    return hash_definition(word_key, pos, source_first_sentence)[:16]
+
+
+def is_pure_alpha_word(word: str) -> bool:
+    """Check if a word contains only ASCII letters (no spaces, hyphens, etc.)."""
+    return bool(re.match(r'^[a-zA-Z]+$', word))
+
+
+# --- Form-of detection ---
+
+_FORM_OF_PATTERNS = [
+    ("plural", re.compile(r'^plural of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("alt_form", re.compile(r'^alternative form of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("alt_spell", re.compile(r'^alternative spelling of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("archaic", re.compile(r'^archaic (?:form|spelling) of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("obsolete", re.compile(r'^obsolete (?:form|spelling) of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("dated", re.compile(r'^dated (?:form|spelling) of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("rare", re.compile(r'^rare (?:form|spelling) of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("abbreviation", re.compile(r'^abbreviation of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("clipping", re.compile(r'^clipping of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("diminutive", re.compile(r'^diminutive of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("superlative", re.compile(r'^superlative of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("comparative", re.compile(r'^comparative of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Past tense forms: "simple past of X", "simple past and past participle of X", "past tense of X"
+    ("past_tense", re.compile(r'^(?:simple )?past(?: tense)?(?: and past participle)? of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("past_participle", re.compile(r'^past participle of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Present participle: "present participle of X", "present participle and gerund of X"
+    ("present_participle", re.compile(r'^present participle(?: and gerund)? of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Third person: "third-person singular simple present indicative of X"
+    ("third_person", re.compile(r'^third[- ]person singular .*?(?:form|indicative) of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Initialisms and acronyms
+    ("initialism", re.compile(r'^initialism of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("acronym", re.compile(r'^acronym of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Eye dialect and non-standard spellings
+    ("eye_dialect", re.compile(r'^eye dialect (?:spelling )?of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("informal_spell", re.compile(r'^informal spelling of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("censored_spell", re.compile(r'^censored spelling of\s+(.+?)\.?$', re.IGNORECASE)),
+    ("nonstandard_spell", re.compile(r'^non-?(?:oxford )?(?:british )?(?:english )?(?:standard )?spelling of\s+(.+?)\.?$', re.IGNORECASE)),
+    # Agent noun
+    ("agent_noun", re.compile(r'^agent noun of\s+(.+?)\.?$', re.IGNORECASE)),
+]
+
+
+def detect_form_of(definition: str) -> Optional[Tuple[str, str]]:
+    """Detect if a definition is a form-of reference.
+
+    Returns (form_type, base_word_key) or None.
+    """
+    defn = definition.strip()
+    for form_type, pattern in _FORM_OF_PATTERNS:
+        m = pattern.match(defn)
+        if m:
+            base = m.group(1).strip().strip('"').strip("'")
+            # Clean up common trailing noise
+            base = re.sub(r'\s*\(.*\)\s*$', '', base).strip()
+            if base:
+                return (form_type, normalize_word_key(base))
+    return None
+
+
+def finalize_extract_word_hashes(conn: sqlite3.Connection, extract_id: int, checkpoint_interval: int = 1000) -> int:
+    """Compute and persist word hashes after definitions have been ingested."""
+    rows = conn.execute(
+        "SELECT word_key, display_word FROM source_words WHERE extract_id=? ORDER BY word_key",
+        (extract_id,),
+    ).fetchall()
+    updated = 0
+    for idx, (word_key, display_word) in enumerate(rows, start=1):
+        def_hashes = [
+            row[0]
+            for row in conn.execute(
+                "SELECT source_hash FROM source_definitions WHERE extract_id=? AND word_key=? ORDER BY source_idx",
+                (extract_id, word_key),
+            ).fetchall()
+        ]
+        if not def_hashes:
+            continue
+        word_hash = hash_word(word_key, display_word, def_hashes)
+        conn.execute(
+            "UPDATE source_words SET word_hash=? WHERE extract_id=? AND word_key=?",
+            (word_hash, extract_id, word_key),
+        )
+        updated += 1
+        if checkpoint_interval > 0 and idx % checkpoint_interval == 0:
+            conn.commit()
+    conn.commit()
+    return updated
 
 
 def connect_state(db_path: str) -> sqlite3.Connection:
@@ -181,6 +351,115 @@ def connect_state(db_path: str) -> sqlite3.Connection:
             helpful_results INTEGER DEFAULT 0,
             created_at INTEGER DEFAULT (strftime('%s','now')),
             FOREIGN KEY (word, definition_idx) REFERENCES definitions(word, idx) ON DELETE CASCADE
+        );
+        """
+    )
+    # --- Stage-1 versioned extract tables ---
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extract_runs (
+            id INTEGER PRIMARY KEY,
+            extract_key TEXT UNIQUE NOT NULL,
+            source_path TEXT NOT NULL,
+            source_url TEXT,
+            file_size INTEGER,
+            sha256 TEXT NOT NULL,
+            etag TEXT,
+            last_modified TEXT,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),
+            builder_version TEXT NOT NULL,
+            notes TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_words (
+            extract_id INTEGER NOT NULL,
+            word_key TEXT NOT NULL,
+            display_word TEXT,
+            language_code TEXT,
+            word_hash TEXT NOT NULL,
+            is_pure_alpha INTEGER NOT NULL,
+            PRIMARY KEY (extract_id, word_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_definitions (
+            extract_id INTEGER NOT NULL,
+            word_key TEXT NOT NULL,
+            definition_key TEXT NOT NULL,
+            source_idx INTEGER NOT NULL,
+            pos TEXT,
+            source_first_sentence TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            normalized_source TEXT NOT NULL,
+            PRIMARY KEY (extract_id, word_key, definition_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS enhanced_words (
+            word_key TEXT NOT NULL,
+            word_hash TEXT NOT NULL,
+            enhancement_version TEXT NOT NULL,
+            pocket_definition TEXT NOT NULL,
+            source_pos_list TEXT,
+            source_definition_count INTEGER NOT NULL,
+            enhanced_source TEXT NOT NULL,
+            quality_status TEXT NOT NULL CHECK(quality_status IN ('accepted','needs_review','failed')),
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (word_key, word_hash, enhancement_version)
+        );
+        """
+    )
+    # Migrate: drop legacy tables if they exist with old schemas
+    conn.execute("DROP TABLE IF EXISTS enhanced_definitions;")
+    # Recreate word_snapshots with new schema (enhancement_action replaces per-def counters)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(word_snapshots);").fetchall()]
+        if "llm_reused_count" in cols:
+            conn.execute("DROP TABLE word_snapshots;")
+    except Exception:
+        pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS word_snapshots (
+            extract_id INTEGER NOT NULL,
+            word_key TEXT NOT NULL,
+            display_word TEXT,
+            word_status TEXT NOT NULL CHECK(word_status IN ('new','changed','unchanged','deleted')),
+            source_definition_count INTEGER NOT NULL,
+            enhancement_action TEXT CHECK(enhancement_action IN ('reused','regenerate','pending')),
+            PRIMARY KEY (extract_id, word_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deploy_runs (
+            id INTEGER PRIMARY KEY,
+            extract_id INTEGER NOT NULL,
+            target TEXT NOT NULL CHECK(target IN ('d1','trie','worker','full')),
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),
+            details_json TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS published_state (
+            target TEXT PRIMARY KEY,
+            extract_id INTEGER NOT NULL,
+            published_at INTEGER NOT NULL,
+            artifact_version TEXT NOT NULL
         );
         """
     )
@@ -1290,7 +1569,7 @@ def summarize_with_lmstudio(
     return None
 
 
-def summarize_all_definitions(
+def synthesize_pocket_definition(
     cfg: LMStudioConfig,
     word: str,
     definitions: List[Tuple[int, Optional[str], str]],  # (idx, pos, source_first_sentence)
@@ -1298,43 +1577,40 @@ def summarize_all_definitions(
     *,
     temperature: Optional[float] = None,
     verbose: bool = False,
-) -> Optional[List[Tuple[int, Optional[str], str]]]:
-    """Send all definitions for a word to the LLM and get back compressed versions.
+) -> Optional[str]:
+    """Synthesize a single pocket-dictionary definition from all source definitions.
 
-    Returns list of (idx, pos, shortened_definition) or None on failure.
-    The LLM may merge or drop definitions to fit within the total word budget.
+    Returns a single definition string or None on failure.
     """
     if _urllib is None:
         return None
 
     # Build the input for the LLM
-    def_entries = []
+    def_lines = []
     for idx, pos, text in definitions:
-        entry: Dict[str, Any] = {"idx": idx, "definition": text}
-        if pos:
-            entry["pos"] = pos
-        def_entries.append(entry)
+        prefix = f"({pos}) " if pos else ""
+        def_lines.append(f"- {prefix}{text}")
 
-    input_json = json.dumps({"word": word, "definitions": def_entries}, ensure_ascii=False)
+    input_text = f"Word: {word}\nSource definitions:\n" + "\n".join(def_lines)
 
     prompt = (
-        f"You are a dictionary editor. Compress all definitions for a word to fit within "
-        f"{max_total_words} words total across ALL definitions combined.\n"
+        f"You are a pocket dictionary editor. Given all definitions for a word, "
+        f"write a single concise definition in under {max_total_words} words — "
+        f"the kind found in a pocket dictionary.\n"
         "Rules:\n"
-        "- Keep each definition as a separate entry\n"
-        "- You may merge near-duplicate definitions into one\n"
-        "- You may drop the least useful definitions if needed to fit the budget\n"
-        "- Preserve the part-of-speech (pos) field exactly as given\n"
-        "- Be concise but accurate — keep the core meaning\n"
-        "- Return a JSON array: [{\"idx\": 0, \"pos\": \"noun\", \"definition\": \"...\"}, ...]\n"
-        "- Output ONLY the JSON array, nothing else"
+        "- Output ONE definition line covering the word's core meaning(s)\n"
+        "- If the word has multiple important senses, combine them naturally (e.g. using semicolons)\n"
+        "- Be concise but accurate\n"
+        "- Do not include examples, etymologies, or cross-references\n"
+        "- Do not include the word itself or part-of-speech labels in the output\n"
+        "- Output ONLY the definition text, nothing else"
     )
 
     payload = {
         "model": cfg.model,
         "messages": [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": input_json},
+            {"role": "user", "content": input_text},
         ],
         "temperature": 0.3 if temperature is None else float(temperature),
         "max_tokens": max(max_total_words * 8, 400),
@@ -1354,56 +1630,29 @@ def summarize_all_definitions(
                 if verbose:
                     print(f"[debug] Empty LLM response for '{word}'")
                 return None
-            raw_text = text.strip()
+            result = text.strip()
 
-            # Parse JSON array from response — try direct parse, then extract from surrounding text
-            result_array = None
-            try:
-                result_array = json.loads(raw_text)
-            except json.JSONDecodeError:
-                # Try to extract JSON array from the text
-                match = re.search(r'\[.*\]', raw_text, re.DOTALL)
-                if match:
-                    try:
-                        result_array = json.loads(match.group())
-                    except json.JSONDecodeError:
-                        pass
+            # Strip LLM artifacts if present
+            result = strip_llm_artifacts(result)
+            # Remove surrounding quotes if the LLM wrapped the definition
+            if len(result) > 2 and result[0] == '"' and result[-1] == '"':
+                result = result[1:-1].strip()
 
-            if not isinstance(result_array, list) or not result_array:
-                if verbose:
-                    print(f"[debug] Failed to parse JSON for '{word}'. Response: {raw_text[:200]}")
+            if not result:
                 return None
 
-            # Validate and extract results
-            valid_idxs = {idx for idx, _, _ in definitions}
-            results: List[Tuple[int, Optional[str], str]] = []
-            for item in result_array:
-                if not isinstance(item, dict):
-                    continue
-                idx = item.get("idx")
-                defn = item.get("definition", "").strip()
-                pos = item.get("pos")
-                if idx not in valid_idxs or not defn:
-                    continue
-                results.append((idx, pos, defn))
-
-            if not results:
+            # Check word count — allow some tolerance
+            wc = _word_count(result)
+            if wc > max_total_words * 1.5:
                 if verbose:
-                    print(f"[debug] No valid entries for '{word}'. Parsed array: {result_array[:2]}... valid_idxs={valid_idxs}")
+                    print(f"[warn] Pocket definition for '{word}' too long: {wc} words (budget {max_total_words})")
                 return None
 
-            # Check total word count — allow some tolerance
-            total_words = sum(_word_count(d) for _, _, d in results)
-            if total_words > max_total_words * 1.5:
-                if verbose:
-                    print(f"[warn] LLM result for '{word}' too long: {total_words} words (budget {max_total_words})")
-                return None
-
-            return results
+            return result
 
     except Exception as e:
         if verbose:
-            print(f"[error] summarize_all_definitions for '{word}': {e}")
+            print(f"[error] synthesize_pocket_definition for '{word}': {e}")
         return None
 
 
@@ -1612,7 +1861,1262 @@ def warm_up_model(cfg: LMStudioConfig, *, temperature: Optional[float] = None, m
             # Brief backoff before retry
             _time.sleep(1.0)
 
-# -------------- Main processing --------------
+# -------------- Stage-1 extract-versioned processing --------------
+
+
+def process_ingest_extract(
+    conn: sqlite3.Connection,
+    input_path: str,
+    checkpoint_interval: int = 1000,
+) -> int:
+    """Ingest a Wiktionary extract into versioned source tables.
+
+    Returns the extract_id of the new run.
+    """
+    import gzip as _gzip_mod
+
+    # Validate input
+    if not os.path.exists(input_path):
+        sys.stderr.write(f"Input file not found: {input_path}\n")
+        raise FileNotFoundError(input_path)
+
+    # Compute file hash and metadata
+    sys.stderr.write(f"Computing file hash for {input_path}...\n")
+    sys.stderr.flush()
+    file_hash = hash_extract_file(input_path)
+    file_size = os.path.getsize(input_path)
+    extract_key = f"sha256:{file_hash[:16]}"
+
+    # Check if this exact extract was already ingested
+    existing = conn.execute(
+        "SELECT id, status FROM extract_runs WHERE sha256=?", (file_hash,)
+    ).fetchone()
+    if existing:
+        eid, estatus = existing
+        if estatus == "complete":
+            sys.stderr.write(f"Extract already ingested (run {eid}, status={estatus}). Skipping.\n")
+            return eid
+        elif estatus == "running":
+            # Previous run was interrupted; delete partial data and re-run
+            sys.stderr.write(f"Previous run {eid} was interrupted. Cleaning up and re-ingesting.\n")
+            conn.execute("DELETE FROM source_definitions WHERE extract_id=?", (eid,))
+            conn.execute("DELETE FROM source_words WHERE extract_id=?", (eid,))
+            conn.execute("DELETE FROM extract_runs WHERE id=?", (eid,))
+            conn.commit()
+        elif estatus == "failed":
+            sys.stderr.write(f"Previous run {eid} failed. Cleaning up and re-ingesting.\n")
+            conn.execute("DELETE FROM source_definitions WHERE extract_id=?", (eid,))
+            conn.execute("DELETE FROM source_words WHERE extract_id=?", (eid,))
+            conn.execute("DELETE FROM extract_runs WHERE id=?", (eid,))
+            conn.commit()
+
+    # Create extract run
+    started_at = int(time.time())
+    conn.execute(
+        """INSERT INTO extract_runs (extract_key, source_path, file_size, sha256, started_at, status, builder_version)
+           VALUES (?, ?, ?, ?, ?, 'running', ?)""",
+        (extract_key, input_path, file_size, file_hash, started_at, BUILDER_VERSION),
+    )
+    conn.commit()
+    extract_id = conn.execute("SELECT id FROM extract_runs WHERE sha256=?", (file_hash,)).fetchone()[0]
+
+    sys.stderr.write(f"Ingesting extract {extract_id} ({extract_key})...\n")
+    sys.stderr.flush()
+
+    # Stream JSONL directly into the DB so large extracts do not require
+    # holding the entire parsed dataset in memory.
+    if input_path.endswith(".gz"):
+        in_f = _gzip_mod.open(input_path, "rt", encoding="utf-8", errors="replace")
+    else:
+        in_f = open(input_path, "r", encoding="utf-8", errors="replace")
+
+    total_lines = 0
+    skipped_lang = 0
+    skipped_misspelling = 0
+    unique_words = 0
+    inserted_definitions = 0
+    last_progress_time = time.time()
+    display_rank_cache: Dict[str, int] = {}
+    next_source_idx: Dict[str, int] = {}
+
+    try:
+        while True:
+            line = in_f.readline()
+            if not line:
+                break
+            total_lines += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            # Language gating
+            lang, code = extract_language(obj)
+            if lang or code:
+                is_en = False
+                if isinstance(lang, str) and lang.lower() == "english":
+                    is_en = True
+                if isinstance(code, str) and code.lower() in ("en", "eng"):
+                    is_en = True
+                if not is_en:
+                    skipped_lang += 1
+                    continue
+
+            word = extract_word(obj)
+            if not word:
+                continue
+
+            defs = extract_definitions(obj)
+            if defs and any(
+                isinstance(g, str) and "misspelling" in g.lower()
+                for _pos, g in defs
+            ):
+                skipped_misspelling += 1
+                continue
+            try:
+                senses = obj.get("senses") if isinstance(obj, dict) else None
+                if isinstance(senses, list):
+                    misspell_flag = False
+                    for s in senses:
+                        if not isinstance(s, dict):
+                            continue
+                        tags = s.get("tags")
+                        if isinstance(tags, list) and any(
+                            isinstance(t, str) and "misspelling" in t.lower() for t in tags
+                        ):
+                            misspell_flag = True
+                            break
+                    if misspell_flag:
+                        skipped_misspelling += 1
+                        continue
+            except Exception:
+                pass
+
+            if not defs:
+                continue
+
+            wkey = normalize_word_key(word)
+            lang_code = code if isinstance(code, str) else "en"
+            display_rank = _casing_rank(word)
+
+            if wkey not in display_rank_cache:
+                inserted = conn.execute(
+                    """INSERT OR IGNORE INTO source_words
+                       (extract_id, word_key, display_word, language_code, word_hash, is_pure_alpha)
+                       VALUES (?, ?, ?, ?, '', ?)""",
+                    (extract_id, wkey, word, lang_code, 1 if is_pure_alpha_word(wkey) else 0),
+                )
+                if inserted.rowcount:
+                    unique_words += 1
+                else:
+                    current = conn.execute(
+                        "SELECT display_word FROM source_words WHERE extract_id=? AND word_key=?",
+                        (extract_id, wkey),
+                    ).fetchone()
+                    if current and display_rank < _casing_rank(current[0]):
+                        conn.execute(
+                            "UPDATE source_words SET display_word=?, language_code=? WHERE extract_id=? AND word_key=?",
+                            (word, lang_code, extract_id, wkey),
+                        )
+                display_rank_cache[wkey] = display_rank
+                if wkey not in next_source_idx:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(source_idx), -1) + 1 FROM source_definitions WHERE extract_id=? AND word_key=?",
+                        (extract_id, wkey),
+                    ).fetchone()
+                    next_source_idx[wkey] = int(row[0]) if row else 0
+            elif display_rank < display_rank_cache[wkey]:
+                conn.execute(
+                    "UPDATE source_words SET display_word=?, language_code=? WHERE extract_id=? AND word_key=?",
+                    (word, lang_code, extract_id, wkey),
+                )
+                display_rank_cache[wkey] = display_rank
+
+            for pos_tag, gloss in defs:
+                source_sentence = _split_sentences(clean_gloss(gloss))
+                source_sentence = source_sentence[0] if source_sentence else clean_gloss(gloss)
+                source_sentence = source_sentence.strip()
+                if not source_sentence:
+                    continue
+
+                normalized_pos = normalize_pos(pos_tag) if pos_tag else None
+                normalized_source = normalize_for_hash(source_sentence)
+                source_hash = hash_definition(wkey, normalized_pos, source_sentence)
+                definition_key = make_definition_key(wkey, normalized_pos, source_sentence)
+                source_idx = next_source_idx.get(wkey, 0)
+
+                inserted = conn.execute(
+                    """INSERT OR IGNORE INTO source_definitions
+                       (extract_id, word_key, definition_key, source_idx, pos, source_first_sentence, source_hash, normalized_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (extract_id, wkey, definition_key, source_idx, normalized_pos, source_sentence, source_hash, normalized_source),
+                )
+                if inserted.rowcount:
+                    inserted_definitions += 1
+                    next_source_idx[wkey] = source_idx + 1
+
+            if checkpoint_interval > 0 and total_lines % checkpoint_interval == 0:
+                conn.commit()
+
+            now = time.time()
+            if now - last_progress_time >= 1.0:
+                sys.stderr.write(
+                    f"\rIngest: lines={total_lines} words={unique_words} definitions={inserted_definitions}"
+                )
+                sys.stderr.flush()
+                last_progress_time = now
+
+        in_f.close()
+        sys.stderr.write(
+            f"\rIngest: lines={total_lines} words={unique_words} definitions={inserted_definitions} (parsing complete)\n"
+        )
+        sys.stderr.flush()
+
+        sys.stderr.write("Finalizing word hashes...\n")
+        sys.stderr.flush()
+        finalize_extract_word_hashes(conn, extract_id, checkpoint_interval=checkpoint_interval)
+
+        conn.execute(
+            "UPDATE extract_runs SET status='complete', completed_at=? WHERE id=?",
+            (int(time.time()), extract_id),
+        )
+        conn.commit()
+
+        sys.stderr.write(
+            f"\rIngest complete: extract_id={extract_id}, words={unique_words}, definitions={inserted_definitions}, "
+            f"lines={total_lines}, skipped_lang={skipped_lang}, skipped_misspelling={skipped_misspelling}\n"
+        )
+        sys.stderr.flush()
+        return extract_id
+    except Exception:
+        conn.execute(
+            "UPDATE extract_runs SET status='failed', completed_at=?, notes=? WHERE id=?",
+            (int(time.time()), "ingest_failed", extract_id),
+        )
+        conn.commit()
+        raise
+    finally:
+        try:
+            in_f.close()
+        except Exception:
+            pass
+
+
+def process_plan_update(
+    conn: sqlite3.Connection,
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compare the latest extract against the prior one and produce a diff report.
+
+    Populates word_snapshots and returns a report dict.
+    """
+    # Find the two most recent completed extracts
+    rows = conn.execute(
+        "SELECT id FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 2"
+    ).fetchall()
+
+    if not rows:
+        sys.stderr.write("No completed extracts found.\n")
+        return {}
+
+    new_extract_id = rows[0][0]
+    prior_extract_id = rows[1][0] if len(rows) > 1 else None
+
+    sys.stderr.write(f"Planning update: new={new_extract_id}, prior={prior_extract_id or 'none'}\n")
+    sys.stderr.flush()
+
+    # Load new extract words
+    new_words = {}
+    for wkey, whash in conn.execute(
+        "SELECT word_key, word_hash FROM source_words WHERE extract_id=?", (new_extract_id,)
+    ):
+        new_words[wkey] = whash
+
+    # Load prior extract words
+    prior_words = {}
+    if prior_extract_id:
+        for wkey, whash in conn.execute(
+            "SELECT word_key, word_hash FROM source_words WHERE extract_id=?", (prior_extract_id,)
+        ):
+            prior_words[wkey] = whash
+
+    # Classify words
+    new_keys = set(new_words.keys())
+    prior_keys = set(prior_words.keys())
+
+    added_keys = new_keys - prior_keys
+    deleted_keys = prior_keys - new_keys
+    common_keys = new_keys & prior_keys
+
+    changed_keys = set()
+    unchanged_keys = set()
+    for wkey in common_keys:
+        if new_words[wkey] != prior_words[wkey]:
+            changed_keys.add(wkey)
+        else:
+            unchanged_keys.add(wkey)
+
+    # Determine enhancement action per word:
+    # - unchanged word_hash with existing pocket def = reused
+    # - changed/new word_hash = regenerate
+    words_reusable = 0
+    words_to_regenerate = 0
+
+    # Clear old snapshots for this extract
+    conn.execute("DELETE FROM word_snapshots WHERE extract_id=?", (new_extract_id,))
+
+    def _get_def_count(eid: int, wkey: str) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM source_definitions WHERE extract_id=? AND word_key=?",
+            (eid, wkey),
+        ).fetchone()[0]
+
+    def _get_display_word(eid: int, wkey: str) -> str:
+        dw = conn.execute(
+            "SELECT display_word FROM source_words WHERE extract_id=? AND word_key=?",
+            (eid, wkey),
+        ).fetchone()
+        return dw[0] if dw else wkey
+
+    # Process each category
+    for wkey in added_keys:
+        def_count = _get_def_count(new_extract_id, wkey)
+        words_to_regenerate += 1
+        conn.execute(
+            """INSERT INTO word_snapshots
+               (extract_id, word_key, display_word, word_status, source_definition_count, enhancement_action)
+               VALUES (?, ?, ?, 'new', ?, 'regenerate')""",
+            (new_extract_id, wkey, _get_display_word(new_extract_id, wkey), def_count),
+        )
+
+    for wkey in unchanged_keys:
+        def_count = _get_def_count(new_extract_id, wkey)
+        # Check if pocket definition already exists for this word_hash
+        whash = new_words[wkey]
+        has_pocket = conn.execute(
+            """SELECT 1 FROM enhanced_words
+               WHERE word_key=? AND word_hash=? AND enhancement_version=?
+                 AND quality_status='accepted'""",
+            (wkey, whash, ENHANCEMENT_VERSION),
+        ).fetchone()
+        if has_pocket:
+            action = "reused"
+            words_reusable += 1
+        else:
+            action = "regenerate"
+            words_to_regenerate += 1
+        conn.execute(
+            """INSERT INTO word_snapshots
+               (extract_id, word_key, display_word, word_status, source_definition_count, enhancement_action)
+               VALUES (?, ?, ?, 'unchanged', ?, ?)""",
+            (new_extract_id, wkey, _get_display_word(new_extract_id, wkey), def_count, action),
+        )
+
+    for wkey in changed_keys:
+        def_count = _get_def_count(new_extract_id, wkey)
+        words_to_regenerate += 1
+        conn.execute(
+            """INSERT INTO word_snapshots
+               (extract_id, word_key, display_word, word_status, source_definition_count, enhancement_action)
+               VALUES (?, ?, ?, 'changed', ?, 'regenerate')""",
+            (new_extract_id, wkey, _get_display_word(new_extract_id, wkey), def_count),
+        )
+
+    for wkey in deleted_keys:
+        dw = _get_display_word(prior_extract_id, wkey) if prior_extract_id else wkey
+        conn.execute(
+            """INSERT INTO word_snapshots
+               (extract_id, word_key, display_word, word_status, source_definition_count, enhancement_action)
+               VALUES (?, ?, ?, 'deleted', 0, NULL)""",
+            (new_extract_id, wkey, dw),
+        )
+
+    conn.commit()
+
+    # Count pure words
+    new_pure = conn.execute(
+        "SELECT COUNT(*) FROM source_words WHERE extract_id=? AND is_pure_alpha=1",
+        (new_extract_id,),
+    ).fetchone()[0]
+    prior_pure = 0
+    if prior_extract_id:
+        prior_pure = conn.execute(
+            "SELECT COUNT(*) FROM source_words WHERE extract_id=? AND is_pure_alpha=1",
+            (prior_extract_id,),
+        ).fetchone()[0]
+
+    report = {
+        "extract_id": new_extract_id,
+        "prior_extract_id": prior_extract_id,
+        "total_words_new_extract": len(new_words),
+        "total_words_prior_extract": len(prior_words),
+        "unchanged_words": len(unchanged_keys),
+        "changed_words": len(changed_keys),
+        "new_words": len(added_keys),
+        "deleted_words": len(deleted_keys),
+        "words_reusable": words_reusable,
+        "words_to_regenerate": words_to_regenerate,
+        "pure_word_count": new_pure,
+        "pure_word_delta": new_pure - prior_pure,
+    }
+
+    # Print summary
+    sys.stderr.write(f"\n=== Update Plan ===\n")
+    sys.stderr.write(f"  Extract: {new_extract_id} (prior: {prior_extract_id or 'none'})\n")
+    sys.stderr.write(f"  Words: {len(new_words)} total\n")
+    sys.stderr.write(f"    unchanged:     {len(unchanged_keys)}\n")
+    sys.stderr.write(f"    changed:       {len(changed_keys)}\n")
+    sys.stderr.write(f"    new:           {len(added_keys)}\n")
+    sys.stderr.write(f"    deleted:       {len(deleted_keys)}\n")
+    sys.stderr.write(f"  Pocket definitions:\n")
+    sys.stderr.write(f"    reusable:      {words_reusable}\n")
+    sys.stderr.write(f"    to regenerate: {words_to_regenerate}\n")
+    sys.stderr.write(f"  Pure words: {new_pure} (delta: {new_pure - prior_pure:+d})\n")
+    sys.stderr.flush()
+
+    # Write report
+    if output_path:
+        ensure_parent_dir(output_path)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        sys.stderr.write(f"  Report written to {output_path}\n")
+        sys.stderr.flush()
+
+    return report
+
+
+def process_enhance_changed(
+    conn: sqlite3.Connection,
+    use_lmstudio: "LMStudioConfig",
+    max_total_words: int,
+    checkpoint_interval: int = 100,
+    temperature: Optional[float] = None,
+    enable_web_search: bool = False,
+    verbose: bool = False,
+    dry_run: bool = False,
+    batch_size: int = 0,
+) -> Dict[str, int]:
+    """Produce a single pocket-dictionary definition for each word needing enhancement.
+
+    A word needs enhancement when its word_hash is not already in enhanced_words
+    for the current ENHANCEMENT_VERSION.
+
+    Returns summary stats.
+    """
+    # Find latest completed extract
+    row = conn.execute(
+        "SELECT id FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        sys.stderr.write("No completed extract found.\n")
+        return {"error": 1}
+    extract_id = row[0]
+
+    # Find words needing pocket definitions:
+    # word_hash not already in enhanced_words for current ENHANCEMENT_VERSION
+    all_words = conn.execute(
+        "SELECT word_key, word_hash FROM source_words WHERE extract_id=?",
+        (extract_id,),
+    ).fetchall()
+
+    words_to_enhance: List[Tuple[str, str]] = []  # (word_key, word_hash)
+    words_reused: List[str] = []
+
+    for wkey, whash in all_words:
+        existing = conn.execute(
+            """SELECT 1 FROM enhanced_words
+               WHERE word_key=? AND word_hash=? AND enhancement_version=?
+                 AND quality_status='accepted'""",
+            (wkey, whash, ENHANCEMENT_VERSION),
+        ).fetchone()
+        if existing:
+            words_reused.append(wkey)
+        else:
+            words_to_enhance.append((wkey, whash))
+
+    sys.stderr.write(f"Enhance: {len(words_to_enhance)} words to enhance, "
+                     f"{len(words_reused)} reused (unchanged)\n")
+    sys.stderr.flush()
+
+    if dry_run:
+        return {
+            "words_to_enhance": len(words_to_enhance),
+            "words_reused": len(words_reused),
+            "dry_run": 1,
+        }
+
+    # Process each word
+    enhanced_count = 0
+    passthrough_count = 0
+    failed_count = 0
+    processed_words = 0
+    last_progress_time = time.time()
+
+    word_list = words_to_enhance
+    if batch_size > 0:
+        word_list = word_list[:batch_size]
+
+    for wkey, whash in word_list:
+        # Get all source definitions for this word
+        src_rows = conn.execute(
+            "SELECT source_idx, pos, source_first_sentence "
+            "FROM source_definitions WHERE extract_id=? AND word_key=? ORDER BY source_idx",
+            (extract_id, wkey),
+        ).fetchall()
+
+        if not src_rows:
+            processed_words += 1
+            continue
+
+        all_defs = [(idx, pos, src) for idx, pos, src in src_rows]
+        pos_list = sorted(set(pos for _, pos, _ in src_rows if pos))
+
+        # If only one short definition, pass through without LLM
+        if len(all_defs) == 1 and _word_count(all_defs[0][2]) <= max_total_words:
+            pocket_def = all_defs[0][2]
+            source = "passthrough"
+            passthrough_count += 1
+        else:
+            # Synthesize a single pocket definition via LLM
+            pocket_def = synthesize_pocket_definition(
+                use_lmstudio, wkey, all_defs, max_total_words,
+                temperature=temperature, verbose=verbose,
+            )
+            source = "llm"
+
+        if pocket_def:
+            conn.execute(
+                """INSERT OR REPLACE INTO enhanced_words
+                   (word_key, word_hash, enhancement_version,
+                    pocket_definition, source_pos_list, source_definition_count,
+                    enhanced_source, quality_status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?)""",
+                (wkey, whash, ENHANCEMENT_VERSION,
+                 pocket_def, json.dumps(pos_list), len(all_defs),
+                 source, int(time.time())),
+            )
+            if source == "llm":
+                enhanced_count += 1
+        else:
+            failed_count += 1
+
+        processed_words += 1
+        if processed_words % checkpoint_interval == 0:
+            conn.commit()
+
+        now = time.time()
+        if now - last_progress_time >= 1.0:
+            sys.stderr.write(f"\rEnhance: {processed_words}/{len(word_list)} words, "
+                             f"{enhanced_count} llm, {passthrough_count} passthrough, {failed_count} failed")
+            sys.stderr.flush()
+            last_progress_time = now
+
+    conn.commit()
+    sys.stderr.write(f"\rEnhance complete: {processed_words} words, "
+                     f"{enhanced_count} llm, {passthrough_count} passthrough, {failed_count} failed, "
+                     f"{len(words_reused)} reused\n")
+    sys.stderr.flush()
+
+    # Update word_snapshots with enhancement action
+    for wkey, whash in word_list:
+        has_pocket = conn.execute(
+            """SELECT enhanced_source FROM enhanced_words
+               WHERE word_key=? AND word_hash=? AND enhancement_version=?
+                 AND quality_status='accepted'""",
+            (wkey, whash, ENHANCEMENT_VERSION),
+        ).fetchone()
+        action = "reused" if has_pocket else "pending"
+        if has_pocket and has_pocket[0] in ("llm", "passthrough"):
+            action = "regenerate"  # was just regenerated this run
+        conn.execute(
+            """UPDATE word_snapshots SET enhancement_action=?
+               WHERE extract_id=? AND word_key=?""",
+            (action, extract_id, wkey),
+        )
+    conn.commit()
+
+    return {
+        "words_enhanced": enhanced_count,
+        "words_passthrough": passthrough_count,
+        "words_reused": len(words_reused),
+        "failed_words": failed_count,
+    }
+
+
+def _resolve_pocket_definition(
+    conn: sqlite3.Connection,
+    extract_id: int,
+    wkey: str,
+    whash: str,
+) -> Optional[str]:
+    """Get the pocket definition for a word, preferring enhanced, falling back to source."""
+    enhanced = conn.execute(
+        """SELECT pocket_definition FROM enhanced_words
+           WHERE word_key=? AND word_hash=? AND enhancement_version=?
+             AND quality_status='accepted'
+           ORDER BY updated_at DESC LIMIT 1""",
+        (wkey, whash, ENHANCEMENT_VERSION),
+    ).fetchone()
+    if enhanced and enhanced[0]:
+        return enhanced[0]
+    # Fallback: first source definition
+    fallback = conn.execute(
+        "SELECT source_first_sentence FROM source_definitions WHERE extract_id=? AND word_key=? ORDER BY source_idx LIMIT 1",
+        (extract_id, wkey),
+    ).fetchone()
+    return fallback[0] if fallback else None
+
+
+def _build_form_of_maps(
+    conn: sqlite3.Connection,
+    extract_id: int,
+) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Tuple[str, str]]]:
+    """Scan source definitions for form-of references.
+
+    Returns:
+      base_to_forms: {base_word_key: [(form_word_key, form_type), ...]}
+      form_to_base:  {form_word_key: (base_word_key, form_type)}
+                     Only words whose ONLY definitions are form-of refs.
+    """
+    # First pass: find all form-of definitions
+    all_form_refs: Dict[str, List[Tuple[str, str]]] = {}  # word_key -> [(base_key, form_type)]
+    all_def_counts: Dict[str, int] = {}
+
+    rows = conn.execute(
+        "SELECT word_key, source_first_sentence FROM source_definitions WHERE extract_id=?",
+        (extract_id,),
+    ).fetchall()
+
+    for wkey, defn in rows:
+        all_def_counts[wkey] = all_def_counts.get(wkey, 0) + 1
+        ref = detect_form_of(defn)
+        if ref:
+            form_type, base_key = ref
+            if wkey not in all_form_refs:
+                all_form_refs[wkey] = []
+            all_form_refs[wkey].append((base_key, form_type))
+
+    # Identify words that are purely form-of (all their defs are form-of refs to the same base)
+    form_to_base: Dict[str, Tuple[str, str]] = {}
+    for wkey, refs in all_form_refs.items():
+        total_defs = all_def_counts.get(wkey, 0)
+        if len(refs) == total_defs:
+            # All definitions are form-of — pick the first reference
+            base_key, form_type = refs[0]
+            if base_key != wkey:  # don't self-reference
+                form_to_base[wkey] = (base_key, form_type)
+
+    # Resolve chains: if A -> B -> C, flatten to A -> C
+    # This handles cases like abbassides -> abbasside -> abbasid
+    def resolve_base(wkey: str, max_depth: int = 10) -> Tuple[str, str]:
+        base_key, form_type = form_to_base[wkey]
+        seen = {wkey}
+        depth = 0
+        while base_key in form_to_base and depth < max_depth:
+            if base_key in seen:
+                break  # cycle
+            seen.add(base_key)
+            base_key, _ = form_to_base[base_key]
+            depth += 1
+        return (base_key, form_type)
+
+    for wkey in list(form_to_base.keys()):
+        form_to_base[wkey] = resolve_base(wkey)
+
+    # Build reverse map: base_word -> forms
+    base_to_forms: Dict[str, List[Tuple[str, str]]] = {}
+    for form_key, (base_key, form_type) in form_to_base.items():
+        if base_key not in base_to_forms:
+            base_to_forms[base_key] = []
+        base_to_forms[base_key].append((form_key, form_type))
+
+    # Sort forms for determinism
+    for base_key in base_to_forms:
+        base_to_forms[base_key].sort()
+
+    return base_to_forms, form_to_base
+
+
+_FORM_TYPE_LABELS = {
+    "plural": "plural",
+    "alt_form": "also",
+    "alt_spell": "also",
+    "archaic": "archaic",
+    "obsolete": "obsolete",
+    "dated": "dated",
+    "rare": "rare",
+    "abbreviation": "abbreviation",
+    "clipping": "clipping",
+    "diminutive": "diminutive",
+    "superlative": "superlative",
+    "comparative": "comparative",
+    "past_tense": "past tense",
+    "past_participle": "past participle",
+    "present_participle": "present participle",
+    "third_person": "third person",
+    "initialism": "initialism",
+    "acronym": "acronym",
+    "eye_dialect": "eye dialect",
+    "informal_spell": "informal spelling",
+    "censored_spell": "censored spelling",
+    "nonstandard_spell": "nonstandard spelling",
+    "agent_noun": "agent noun",
+}
+
+
+def _format_forms_note(forms: List[Tuple[str, str]]) -> str:
+    """Format a list of (form_word, form_type) into a parenthetical note."""
+    # Group by form type
+    by_type: Dict[str, List[str]] = {}
+    for form_word, form_type in forms:
+        label = _FORM_TYPE_LABELS.get(form_type, form_type)
+        if label not in by_type:
+            by_type[label] = []
+        by_type[label].append(form_word)
+
+    parts = []
+    for label, words in by_type.items():
+        if len(words) <= 3:
+            parts.append(f"{label}: {', '.join(words)}")
+        else:
+            parts.append(f"{label}: {', '.join(words[:3])}, ...")
+    return " (" + "; ".join(parts) + ")"
+
+
+def process_export_current(
+    conn: sqlite3.Connection,
+    output_path: str,
+    pure_db_path: Optional[str] = None,
+    pure_words_path: Optional[str] = None,
+) -> None:
+    """Export the latest extract snapshot with one pocket definition per word.
+
+    Form-of words (plurals, alternative forms, etc.) get the base word's
+    definition prefixed with the relationship. Base words get a parenthetical
+    note listing their known forms.
+
+    Produces:
+    - output_path: full dictionary SQLite (all words, one definition each)
+    - pure_db_path: pure alpha words only (same schema)
+    - pure_words_path: one word per line text file
+    """
+    # Find latest completed extract
+    row = conn.execute(
+        "SELECT id FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        sys.stderr.write("No completed extract found.\n")
+        return
+    extract_id = row[0]
+
+    sys.stderr.write(f"Exporting from extract {extract_id}...\n")
+    sys.stderr.flush()
+
+    # Build form-of maps
+    sys.stderr.write("Scanning form-of references...\n")
+    sys.stderr.flush()
+    base_to_forms, form_to_base = _build_form_of_maps(conn, extract_id)
+    sys.stderr.write(f"  {len(form_to_base)} form-of words, {len(base_to_forms)} base words with forms\n")
+    sys.stderr.flush()
+
+    # Create output DB with two-table schema:
+    #   words:       id INTEGER PRIMARY KEY, word TEXT UNIQUE
+    #   definitions: id INTEGER PRIMARY KEY, definition TEXT
+    # Form-of words share the same id as their base word.
+    ensure_parent_dir(output_path)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    out_conn = sqlite3.connect(output_path)
+    out_conn.execute("PRAGMA journal_mode=WAL;")
+    out_conn.execute("PRAGMA synchronous=NORMAL;")
+    out_conn.execute("CREATE TABLE words (id INTEGER NOT NULL, word TEXT PRIMARY KEY);")
+    out_conn.execute("CREATE TABLE definitions (id INTEGER PRIMARY KEY, definition TEXT NOT NULL);")
+
+    # First pass: resolve all base definitions and cache them
+    all_words = conn.execute(
+        "SELECT word_key, display_word, word_hash, is_pure_alpha FROM source_words WHERE extract_id=? ORDER BY word_key",
+        (extract_id,),
+    ).fetchall()
+
+    word_defs: Dict[str, str] = {}
+    word_hashes: Dict[str, str] = {}
+    pure_flags: Dict[str, bool] = {}
+
+    for wkey, display_word, whash, is_pure in all_words:
+        word_hashes[wkey] = whash
+        pure_flags[wkey] = bool(is_pure)
+        defn = _resolve_pocket_definition(conn, extract_id, wkey, whash)
+        if defn:
+            word_defs[wkey] = defn
+
+    # Assign IDs: each base word gets a stable hash-based id.
+    # Form-of words share their base word's id.
+    base_word_id: Dict[str, int] = {}  # base_word_key -> id
+
+    # Second pass: assign IDs to base words and build their definitions
+    base_defs_enriched: Dict[str, str] = {}
+    base_annotated = 0
+
+    for wkey in word_defs:
+        if wkey in form_to_base:
+            continue  # form-of words get their base's id later
+        base_word_id[wkey] = stable_def_id(wkey)
+        definition = word_defs[wkey]
+        if wkey in base_to_forms:
+            forms_note = _format_forms_note(base_to_forms[wkey])
+            definition = definition + forms_note
+            base_annotated += 1
+        base_defs_enriched[wkey] = definition
+
+    # Third pass: export all words
+    words_written = 0
+    defs_written = 0
+    forms_mapped = 0
+    pure_words_list = []
+    written_def_ids: set = set()
+
+    for wkey, display_word, whash, is_pure in all_words:
+        if wkey not in word_defs:
+            continue
+
+        if wkey in form_to_base:
+            base_key, form_type = form_to_base[wkey]
+            if base_key in base_word_id and base_key in base_defs_enriched:
+                wid = base_word_id[base_key]
+                forms_mapped += 1
+            else:
+                # Base word not in export — give this word its own stable id
+                wid = stable_def_id(wkey)
+                base_defs_enriched[wkey] = word_defs[wkey]
+                base_word_id[wkey] = wid
+        else:
+            wid = base_word_id[wkey]
+
+        out_conn.execute("INSERT INTO words (id, word) VALUES (?, ?)", (wid, wkey))
+        words_written += 1
+
+        # Write definition only once per id
+        if wid not in written_def_ids:
+            definition = base_defs_enriched.get(wkey if wkey not in form_to_base else form_to_base[wkey][0], word_defs[wkey])
+            out_conn.execute("INSERT INTO definitions (id, definition) VALUES (?, ?)", (wid, definition))
+            written_def_ids.add(wid)
+            defs_written += 1
+
+        if is_pure:
+            pure_words_list.append(wkey)
+
+    out_conn.commit()
+    out_conn.close()
+
+    sys.stderr.write(f"Exported {words_written} words, {defs_written} definitions to {output_path}\n")
+    sys.stderr.write(f"  {forms_mapped} form words sharing base definition\n")
+    sys.stderr.write(f"  {base_annotated} base words annotated with forms\n")
+
+    if pure_db_path:
+        ensure_parent_dir(pure_db_path)
+        if os.path.exists(pure_db_path):
+            os.remove(pure_db_path)
+        pure_conn = sqlite3.connect(pure_db_path)
+        pure_conn.execute("PRAGMA journal_mode=WAL;")
+        pure_conn.execute("PRAGMA synchronous=NORMAL;")
+        pure_conn.execute("CREATE TABLE words (id INTEGER NOT NULL, word TEXT PRIMARY KEY);")
+        pure_conn.execute("CREATE TABLE definitions (id INTEGER PRIMARY KEY, definition TEXT NOT NULL);")
+
+        full_conn = sqlite3.connect(output_path)
+        # Copy words and their definitions (dedup definitions via id)
+        seen_ids: set = set()
+        for pw in pure_words_list:
+            row = full_conn.execute("SELECT id, word FROM words WHERE word=?", (pw,)).fetchone()
+            if row:
+                pure_conn.execute("INSERT INTO words (id, word) VALUES (?, ?)", row)
+                if row[0] not in seen_ids:
+                    def_row = full_conn.execute("SELECT id, definition FROM definitions WHERE id=?", (row[0],)).fetchone()
+                    if def_row:
+                        pure_conn.execute("INSERT INTO definitions (id, definition) VALUES (?, ?)", def_row)
+                        seen_ids.add(row[0])
+
+        pure_conn.commit()
+        pure_conn.close()
+        full_conn.close()
+        sys.stderr.write(f"Exported {len(pure_words_list)} pure words, {len(seen_ids)} definitions to {pure_db_path}\n")
+
+    if pure_words_path:
+        ensure_parent_dir(pure_words_path)
+        with open(pure_words_path, "w", encoding="utf-8") as f:
+            for pw in sorted(pure_words_list):
+                f.write(pw + "\n")
+        sys.stderr.write(f"Wrote {len(pure_words_list)} pure words to {pure_words_path}\n")
+
+    sys.stderr.flush()
+
+
+def _quote_sql(v: Any) -> str:
+    """Quote a value for SQL insertion."""
+    if v is None:
+        return "NULL"
+    s = str(v).replace("\r", " ").replace("\n", " ").replace("'", "''")
+    return f"'{s}'"
+
+
+def process_generate_deploy_sql(
+    conn: sqlite3.Connection,
+    pure_db_path: str,
+    out_dir: str,
+) -> Dict[str, Any]:
+    """Generate deploy SQL using word_snapshots to determine what changed.
+
+    Reads the current extract's word_snapshots (new/changed/deleted) and
+    the pure DB (for actual data), then emits minimal SQL to update D1.
+
+    For the first deploy (no prior extract), emits a full INSERT set.
+
+    Outputs:
+      {out_dir}/_words.sql
+      {out_dir}/_definitions.sql
+      {out_dir}/_deploy_meta.json
+    """
+    row = conn.execute(
+        "SELECT id FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        raise RuntimeError("No completed extract found.")
+    extract_id = row[0]
+
+    # Check if this extract is already published to D1
+    published = conn.execute(
+        "SELECT extract_id FROM published_state WHERE target='d1'"
+    ).fetchone()
+    if published and published[0] == extract_id:
+        sys.stderr.write(f"Extract {extract_id} already published to D1 — nothing to deploy\n")
+        ensure_parent_dir(os.path.join(out_dir, "_words.sql"))
+        # Write empty files
+        open(os.path.join(out_dir, "_words.sql"), "w").close()
+        open(os.path.join(out_dir, "_definitions.sql"), "w").close()
+        meta = {"mode": "skip", "extract_id": extract_id, "total_operations": 0, "reason": "already published"}
+        with open(os.path.join(out_dir, "_deploy_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+        return meta
+
+    # Determine full vs delta based on what's currently published in D1
+    is_first_deploy = not published
+
+    pure_conn = sqlite3.connect(pure_db_path)
+
+    stats: Dict[str, int] = {
+        "words_inserted": 0,
+        "words_updated": 0,
+        "words_deleted": 0,
+        "definitions_inserted": 0,
+        "definitions_updated": 0,
+        "definitions_deleted": 0,
+    }
+
+    ensure_parent_dir(os.path.join(out_dir, "_words.sql"))
+    words_file = os.path.join(out_dir, "_words.sql")
+    defs_file = os.path.join(out_dir, "_definitions.sql")
+
+    if is_first_deploy:
+        sys.stderr.write("First deploy — generating full INSERT set\n")
+        with open(defs_file, "w") as f:
+            for row in pure_conn.execute("SELECT id, definition FROM definitions ORDER BY id"):
+                f.write(f"INSERT OR REPLACE INTO definitions VALUES ({row[0]}, {_quote_sql(row[1])});\n")
+                stats["definitions_inserted"] += 1
+
+        with open(words_file, "w") as f:
+            for row in pure_conn.execute("SELECT id, word FROM words ORDER BY word"):
+                f.write(f"INSERT OR REPLACE INTO words VALUES ({row[0]}, {_quote_sql(row[1])});\n")
+                stats["words_inserted"] += 1
+    else:
+        # Delta deploy: use word_snapshots to know what changed
+        # Get changed/new/deleted word keys (pure alpha only)
+        changed_words = set()
+        new_words = set()
+        deleted_words = set()
+
+        for wkey, status in conn.execute(
+            "SELECT ws.word_key, ws.word_status FROM word_snapshots ws "
+            "JOIN source_words sw ON sw.extract_id = ws.extract_id AND sw.word_key = ws.word_key "
+            "WHERE ws.extract_id = ? AND sw.is_pure_alpha = 1 AND ws.word_status != 'unchanged'",
+            (extract_id,),
+        ).fetchall():
+            if status == "new":
+                new_words.add(wkey)
+            elif status == "changed":
+                changed_words.add(wkey)
+            elif status == "deleted":
+                deleted_words.add(wkey)
+
+        # Also find deleted pure-alpha words from the prior extract
+        if prior:
+            prior_id = prior[0]
+            for (wkey,) in conn.execute(
+                "SELECT sw.word_key FROM source_words sw "
+                "LEFT JOIN source_words sw2 ON sw2.extract_id = ? AND sw2.word_key = sw.word_key "
+                "WHERE sw.extract_id = ? AND sw.is_pure_alpha = 1 AND sw2.word_key IS NULL",
+                (extract_id, prior_id),
+            ).fetchall():
+                deleted_words.add(wkey)
+
+        sys.stderr.write(
+            f"Delta deploy: {len(new_words)} new, {len(changed_words)} changed, "
+            f"{len(deleted_words)} deleted pure words\n"
+        )
+
+        # For new/changed words, we also need to handle their form-of relatives.
+        # A changed base word means all its forms need updating too.
+        # Build set of all affected words by looking up form-of relationships in pure DB.
+        affected_ids: set = set()
+        affected_base_words = new_words | changed_words
+
+        with open(defs_file, "w") as f:
+            # New + changed base words: upsert their definitions
+            for bw in affected_base_words:
+                row = pure_conn.execute("SELECT id, definition FROM words w JOIN definitions d ON d.id = w.id WHERE w.word = ?", (bw,)).fetchone()
+                if row:
+                    def_id, definition = row
+                    if bw in new_words:
+                        f.write(f"INSERT OR REPLACE INTO definitions VALUES ({def_id}, {_quote_sql(definition)});\n")
+                        stats["definitions_inserted"] += 1
+                    else:
+                        f.write(f"INSERT OR REPLACE INTO definitions VALUES ({def_id}, {_quote_sql(definition)});\n")
+                        stats["definitions_updated"] += 1
+                    affected_ids.add(def_id)
+
+            # Deleted words: remove their definitions (only if no other word references them)
+            for dw in deleted_words:
+                # Look up what id this word had — we need the stable id
+                def_id = stable_def_id(dw)
+                # Only delete definition if the id isn't used by any remaining word
+                remaining = pure_conn.execute("SELECT 1 FROM words WHERE id = ? LIMIT 1", (def_id,)).fetchone()
+                if not remaining:
+                    f.write(f"DELETE FROM definitions WHERE id = {def_id};\n")
+                    stats["definitions_deleted"] += 1
+
+        with open(words_file, "w") as f:
+            # New words: insert word rows
+            for nw in new_words:
+                row = pure_conn.execute("SELECT id, word FROM words WHERE word = ?", (nw,)).fetchone()
+                if row:
+                    f.write(f"INSERT OR REPLACE INTO words VALUES ({row[0]}, {_quote_sql(row[1])});\n")
+                    stats["words_inserted"] += 1
+
+            # Changed words that have a new id (base word changed): update
+            for cw in changed_words:
+                row = pure_conn.execute("SELECT id, word FROM words WHERE word = ?", (cw,)).fetchone()
+                if row:
+                    f.write(f"INSERT OR REPLACE INTO words VALUES ({row[0]}, {_quote_sql(row[1])});\n")
+                    stats["words_updated"] += 1
+
+            # Also update any form-of words whose base definition changed
+            # (they share the base's id, which is stable, but the definition content changed)
+            for def_id in affected_ids:
+                for (word,) in pure_conn.execute("SELECT word FROM words WHERE id = ?", (def_id,)):
+                    if word not in new_words and word not in changed_words:
+                        # This is a form word whose base was updated — ensure its id mapping is correct
+                        f.write(f"INSERT OR REPLACE INTO words VALUES ({def_id}, {_quote_sql(word)});\n")
+                        stats["words_updated"] += 1
+
+            # Deleted words: remove word rows
+            for dw in deleted_words:
+                f.write(f"DELETE FROM words WHERE word = {_quote_sql(dw)};\n")
+                stats["words_deleted"] += 1
+
+    pure_conn.close()
+
+    total_ops = sum(stats.values())
+    meta = {"mode": "full" if is_first_deploy else "delta", "extract_id": extract_id, **stats, "total_operations": total_ops}
+
+    meta_file = os.path.join(out_dir, "_deploy_meta.json")
+    with open(meta_file, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    sys.stderr.write(f"Deploy SQL: {total_ops} total operations\n")
+    for k, v in stats.items():
+        if v > 0:
+            sys.stderr.write(f"  {k}: {v}\n")
+    sys.stderr.flush()
+
+    return meta
+
+
+def process_build_report(
+    conn: sqlite3.Connection,
+    output_path: str,
+    trie_manifest_path: Optional[str] = None,
+    export_db_path: Optional[str] = None,
+    pure_db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a stage-1 report for the latest extract."""
+    row = conn.execute(
+        "SELECT id, sha256, source_path, completed_at FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        raise RuntimeError("No completed extract found.")
+
+    extract_id, sha256, source_path, completed_at = row
+
+    snapshot_counts = {
+        status: count
+        for status, count in conn.execute(
+            "SELECT word_status, COUNT(*) FROM word_snapshots WHERE extract_id=? GROUP BY word_status",
+            (extract_id,),
+        ).fetchall()
+    }
+    total_defs = conn.execute(
+        "SELECT COUNT(*) FROM source_definitions WHERE extract_id=?",
+        (extract_id,),
+    ).fetchone()[0]
+    pure_word_count = conn.execute(
+        "SELECT COUNT(*) FROM source_words WHERE extract_id=? AND is_pure_alpha=1",
+        (extract_id,),
+    ).fetchone()[0]
+
+    # Count pocket definitions by source type
+    pocket_rows = conn.execute(
+        """SELECT enhanced_source, COUNT(*)
+           FROM enhanced_words
+           WHERE enhancement_version=?
+             AND word_key IN (SELECT word_key FROM source_words WHERE extract_id=?)
+           GROUP BY enhanced_source""",
+        (ENHANCEMENT_VERSION, extract_id),
+    ).fetchall()
+    pocket_counts = {source: count for source, count in pocket_rows}
+
+    total_words = conn.execute(
+        "SELECT COUNT(*) FROM source_words WHERE extract_id=?",
+        (extract_id,),
+    ).fetchone()[0]
+
+    report: Dict[str, Any] = {
+        "builder_version": BUILDER_VERSION,
+        "enhancement_version": ENHANCEMENT_VERSION,
+        "extract": {
+            "id": extract_id,
+            "sha256": sha256,
+            "source_path": source_path,
+            "completed_at": completed_at,
+        },
+        "words": {
+            "total": total_words,
+            "pure_alpha": pure_word_count,
+            "new": snapshot_counts.get("new", 0),
+            "changed": snapshot_counts.get("changed", 0),
+            "unchanged": snapshot_counts.get("unchanged", 0),
+            "deleted": snapshot_counts.get("deleted", 0),
+        },
+        "source_definitions": {
+            "total": total_defs,
+        },
+        "pocket_definitions": {
+            "total": sum(pocket_counts.values()),
+            "llm": pocket_counts.get("llm", 0),
+            "passthrough": pocket_counts.get("passthrough", 0),
+        },
+    }
+
+    if export_db_path and os.path.exists(export_db_path):
+        with sqlite3.connect(export_db_path) as export_conn:
+            report["export"] = {
+                "path": export_db_path,
+                "words": export_conn.execute("SELECT COUNT(*) FROM words").fetchone()[0],
+            }
+    if pure_db_path and os.path.exists(pure_db_path):
+        with sqlite3.connect(pure_db_path) as pure_conn:
+            report["pure_export"] = {
+                "path": pure_db_path,
+                "words": pure_conn.execute("SELECT COUNT(*) FROM words").fetchone()[0],
+            }
+    if trie_manifest_path and os.path.exists(trie_manifest_path):
+        with open(trie_manifest_path, "r", encoding="utf-8") as f:
+            report["trie"] = json.load(f)
+
+    ensure_parent_dir(output_path)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    return report
+
+
+def get_pipeline_status(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Return JSON-serializable pipeline status for cron/workflow decisions."""
+    latest = conn.execute(
+        """SELECT id, extract_key, sha256, source_path, completed_at
+           FROM extract_runs
+           WHERE status='complete'
+           ORDER BY id DESC
+           LIMIT 1"""
+    ).fetchone()
+
+    published: Dict[str, Dict[str, Any]] = {}
+    for target, extract_id, published_at, artifact_version in conn.execute(
+        "SELECT target, extract_id, published_at, artifact_version FROM published_state ORDER BY target"
+    ).fetchall():
+        published[target] = {
+            "extract_id": extract_id,
+            "published_at": published_at,
+            "artifact_version": artifact_version,
+        }
+
+    status: Dict[str, Any] = {
+        "latest_extract": None,
+        "published": published,
+        "has_unpublished_extract": False,
+    }
+
+    if latest:
+        latest_extract = {
+            "id": latest[0],
+            "extract_key": latest[1],
+            "sha256": latest[2],
+            "source_path": latest[3],
+            "completed_at": latest[4],
+        }
+        status["latest_extract"] = latest_extract
+        full_published = published.get("full")
+        status["has_unpublished_extract"] = (
+            full_published is None or full_published.get("extract_id") != latest_extract["id"]
+        )
+
+    return status
+
+
+def mark_published(
+    conn: sqlite3.Connection,
+    target: str,
+    artifact_version: str,
+    extract_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Record that a target was published for a given extract."""
+    if extract_id is None:
+        row = conn.execute(
+            "SELECT id FROM extract_runs WHERE status='complete' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            raise RuntimeError("No completed extract found.")
+        extract_id = int(row[0])
+
+    now_ts = int(time.time())
+    conn.execute(
+        """INSERT INTO published_state(target, extract_id, published_at, artifact_version)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(target) DO UPDATE SET
+             extract_id=excluded.extract_id,
+             published_at=excluded.published_at,
+             artifact_version=excluded.artifact_version""",
+        (target, extract_id, now_ts, artifact_version),
+    )
+    conn.commit()
+    return {
+        "target": target,
+        "extract_id": extract_id,
+        "published_at": now_ts,
+        "artifact_version": artifact_version,
+    }
+
+
+# -------------- Main processing (legacy) --------------
 
 
 def process_baseline_mode(
@@ -2589,13 +4093,128 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Cleaned {cleaned_count} definitions by removing tags")
         return 0
 
+    # --- Stage-1 modes ---
+    if args.mode == "ingest-extract":
+        if not args.input:
+            if cfg.get("input"):
+                args.input = str(cfg["input"])
+            else:
+                sys.stderr.write("ingest-extract mode requires --input\n")
+                return 2
+        conn = connect_state(args.state)
+        try:
+            extract_id = process_ingest_extract(conn, args.input, args.checkpoint_interval)
+        except FileNotFoundError:
+            conn.close()
+            return 2
+        conn.close()
+        print(f"Extract {extract_id} ingested successfully.")
+        return 0
+
+    if args.mode == "plan-update":
+        conn = connect_state(args.state)
+        report = process_plan_update(conn, output_path=args.output or "out/update-plan.json")
+        conn.close()
+        return 0
+
+    if args.mode == "enhance-changed":
+        if not args.lmstudio_url or not args.lmstudio_model:
+            # Try config
+            if cfg.get("fast"):
+                fast = cfg.get("fast") or {}
+                args.lmstudio_url = args.lmstudio_url or str(fast.get("url", ""))
+                args.lmstudio_model = args.lmstudio_model or str(fast.get("model", ""))
+            if not args.lmstudio_url or not args.lmstudio_model:
+                sys.stderr.write("enhance-changed mode requires --lmstudio-url and --lmstudio-model\n")
+                return 2
+        lm_cfg = LMStudioConfig(
+            url=args.lmstudio_url, model=args.lmstudio_model,
+            timeout=float(getattr(args, "lm_timeout", 120.0) or 120.0),
+        )
+        conn = connect_state(args.state)
+        stats = process_enhance_changed(
+            conn, lm_cfg, args.max_total_words,
+            checkpoint_interval=args.checkpoint_interval,
+            temperature=getattr(args, "temperature", None),
+            verbose=getattr(args, "verbose", False),
+            dry_run=getattr(args, "dry_run", False),
+            batch_size=getattr(args, "batch_size", 0),
+        )
+        conn.close()
+        print(json.dumps(stats, indent=2))
+        return 0
+
+    if args.mode == "export-current":
+        if not args.output:
+            args.output = "out/current_dictionary.sqlite3"
+        conn = connect_state(args.state)
+        process_export_current(
+            conn, args.output,
+            pure_db_path=getattr(args, "pure_db", None) or "out/pure_dictionary.sqlite3",
+            pure_words_path=getattr(args, "pure_words", None) or "out/pure-words.txt",
+        )
+        conn.close()
+        return 0
+
+    if args.mode == "generate-deploy-sql":
+        conn = connect_state(args.state)
+        pure_db = getattr(args, "pure_db", None) or "out/pure_dictionary.sqlite3"
+        out_dir = args.output or "out"
+        meta = process_generate_deploy_sql(conn, pure_db, out_dir)
+        conn.close()
+        print(json.dumps(meta, indent=2))
+        return 0
+
+    if args.mode == "build-report":
+        if not args.output:
+            args.output = "out/build-report.json"
+        conn = connect_state(args.state)
+        report = process_build_report(
+            conn,
+            args.output,
+            trie_manifest_path=getattr(args, "trie_manifest", None),
+            export_db_path=getattr(args, "export_db", None),
+            pure_db_path=getattr(args, "pure_db", None),
+        )
+        conn.close()
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if args.mode == "pipeline-status":
+        conn = connect_state(args.state)
+        status = get_pipeline_status(conn)
+        conn.close()
+        if args.output:
+            ensure_parent_dir(args.output)
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=2)
+        print(json.dumps(status, indent=2))
+        return 0
+
+    if args.mode == "mark-published":
+        if not args.target:
+            sys.stderr.write("mark-published mode requires --target\n")
+            return 2
+        conn = connect_state(args.state)
+        try:
+            result = mark_published(
+                conn,
+                args.target,
+                args.artifact_version or str(int(time.time())),
+                extract_id=args.extract_id,
+            )
+        finally:
+            conn.close()
+        print(json.dumps(result, indent=2))
+        return 0
+
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--input", help="Input JSONL file")
     p.add_argument("--state", help="SQLite state DB path")
     p.add_argument("--output", help="Output path for export")
-    p.add_argument("--mode", choices=["baseline","enhance","export","verify","verify-lm","manual-review","extract-pure-words","generate-pure-db","cleanup-tags","llm-deduplicate"], default="baseline")
+    p.add_argument("--mode", choices=["baseline","enhance","export","verify","verify-lm","manual-review","extract-pure-words","generate-pure-db","cleanup-tags","llm-deduplicate","ingest-extract","plan-update","enhance-changed","export-current","generate-deploy-sql","build-report","pipeline-status","mark-published"], default="baseline")
     p.add_argument("--lmstudio-url", help="LM Studio URL")
     p.add_argument("--lmstudio-model", help="LM Studio model")
     p.add_argument("--lm-timeout", type=int, default=120)
@@ -2608,6 +4227,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--verify-sample", type=int, default=0, help="Only verify a sample of N definitions (0 = all)")
     p.add_argument("--verbose", action="store_true", help="Show verbose debug output")
     p.add_argument("--config", help="Path to config toml", default="small_dictionary.toml")
+    p.add_argument("--dry-run", action="store_true", help="Preview what would be done without executing")
+    p.add_argument("--batch-size", type=int, default=0, help="Limit number of words to process (0 = all)")
+    p.add_argument("--pure-db", help="Output path for pure words DB (export-current)")
+    p.add_argument("--pure-words", help="Output path for pure words text file (export-current)")
+    p.add_argument("--export-db", help="Export DB path to include in build-report output")
+    p.add_argument("--trie-manifest", help="Trie manifest path to include in build-report output")
+    p.add_argument("--target", help="Published target for mark-published (d1|trie|full)")
+    p.add_argument("--artifact-version", help="Artifact version string for mark-published")
+    p.add_argument("--extract-id", type=int, help="Explicit extract id for mark-published")
     return p.parse_args(argv)
 
 

@@ -1,8 +1,11 @@
 /**
  * GET /api/definitions?word=<word>
  *
- * Returns the word's short definitions from the dictionary DB.
- * Response: { word, found, definitions: [{ definition, pos }] }
+ * Returns the word's pocket definition from the dictionary DB.
+ * Looks up the word in the words table, joins to definitions by id.
+ * Form-of words (e.g. "houses") share their base word's definition id.
+ *
+ * Response: { word, found, definition }
  */
 export async function handleDefinitions(request, env) {
   const url = new URL(request.url);
@@ -14,22 +17,18 @@ export async function handleDefinitions(request, env) {
 
   const lower = rawWord.toLowerCase();
 
-  const wordRow = await env.DB.prepare(
-    'SELECT word, raw FROM words WHERE word = ? LIMIT 1'
+  const row = await env.DB.prepare(
+    'SELECT w.word, d.definition FROM words w JOIN definitions d ON d.id = w.id WHERE w.word = ? LIMIT 1'
   ).bind(lower).first();
 
-  const defs = (await env.DB.prepare(
-    'SELECT definition, pos FROM definitions WHERE word = ? ORDER BY idx'
-  ).bind(lower).all()).results || [];
-
-  if (!wordRow && !defs.length) {
-    return json({ word: lower, found: false, definitions: [] }, 404);
+  if (!row) {
+    return json({ word: lower, found: false, definition: null }, 404);
   }
 
   return json({
-    word: wordRow?.raw || lower,
+    word: row.word,
     found: true,
-    definitions: defs,
+    definition: row.definition,
   });
 }
 
